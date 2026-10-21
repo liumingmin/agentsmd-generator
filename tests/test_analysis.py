@@ -149,19 +149,6 @@ class ProjectCase(unittest.TestCase):
         self.assertEqual(sum('超出有效范围' in e for e in errors), 3)
         self.assertTrue(any('不一致' in e for e in errors))
 
-    def test_doc_selection_preserves_unrelated_template_instructions(self):
-        self.write('main.py', 'def run(): return 1\n')
-        self.write('.agentsmd/index.json', json.dumps(self.report([self.indexed('main.py')])))
-        self.write('AGENTS.md', '## 模块地图\n## 架构与数据流\n## 构建/运行/测试\n')
-        template = self.write('templates/topic/AGENTS.md', '# Topic 协作约定\n只修改当前 Topic。\n')
-        before = template.read_bytes()
-        result = self.script('verify.py', '--root', self.root, '--doc', 'AGENTS.md', '--strict')
-        self.assertIn('文档 1 个', result.stdout)
-        self.assertEqual(template.read_bytes(), before)
-        failed = subprocess.run([sys.executable, str(REPO / 'scripts/verify.py'), '--root', str(self.root),
-                                 '--doc', 'AGENTS.missing.md'], text=True, capture_output=True)
-        self.assertEqual(failed.returncode, 2)
-
     def test_verify_detects_same_line_count_stale_index_and_wrong_links(self):
         self.write('one.py', 'def f(): return 1\n')
         self.write('two.py', 'def g(): return 2\n')

@@ -69,7 +69,6 @@ type PkgInfo struct {
 
 // Route 表示一个 HTTP 路由注册（如 admin.POST("/path", Handler)）。
 type Route struct {
-	IsTest     bool     `json:"is_test"`
 	Receiver   string   `json:"receiver"`
 	Handlers   []string `json:"handlers"`
 	Confidence string   `json:"confidence"`
@@ -82,7 +81,6 @@ type Route struct {
 
 // CronJob 表示一个 cron 表达式（来自字符串字面量或注释）。
 type CronJob struct {
-	IsTest     bool   `json:"is_test"`
 	Source     string `json:"source"`
 	Confidence string `json:"confidence"`
 	Expr       string `json:"expr"` // cron 表达式
@@ -194,18 +192,17 @@ func main() {
 			switch node := n.(type) {
 			case *ast.CallExpr:
 				if r, ok := extractRoute(fset, node, rel); ok {
-					r.IsTest = isTest
 					report.Routes = append(report.Routes, r)
 				}
 			case *ast.BasicLit:
 				if node.Kind == token.STRING {
 					if expr, ok := parseCron(unquote(node.Value)); ok {
-						report.Crons = append(report.Crons, CronJob{Expr: expr, File: rel, Line: fset.Position(node.Pos()).Line, Source: "string", Confidence: "candidate", IsTest: isTest})
+						report.Crons = append(report.Crons, CronJob{Expr: expr, File: rel, Line: fset.Position(node.Pos()).Line, Source: "string", Confidence: "candidate"})
 					}
 				}
 			case *ast.Comment:
 				if expr, ok := parseCron(node.Text); ok {
-					report.Crons = append(report.Crons, CronJob{Expr: expr, File: rel, Line: fset.Position(node.Pos()).Line, Source: "comment", Confidence: "candidate", IsTest: isTest})
+					report.Crons = append(report.Crons, CronJob{Expr: expr, File: rel, Line: fset.Position(node.Pos()).Line, Source: "comment", Confidence: "candidate"})
 				}
 			}
 			return true

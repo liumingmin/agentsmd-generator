@@ -66,14 +66,11 @@ func TestAnalyzerCLIIncludesTrailingLinesAndDiagnostics(t *testing.T) {
 	if err := os.MkdirAll(root, 0755); err != nil {
 		t.Fatal(err)
 	}
-	source := "//go:build linux\n\npackage demo\n\ntype Box[T any] struct {\n  Value [4]T\n  Callback func(int) error\n}\n\nfunc Apply[T ~int](x T) T { return x + 1 }\nfunc register() { router.GET(\"/prod\", handler) }\nvar schedule = \"0 0 * * *\"\n// trailing comment\n\n"
+	source := "//go:build linux\n\npackage demo\n\ntype Box[T any] struct {\n  Value [4]T\n  Callback func(int) error\n}\n\nfunc Apply[T ~int](x T) T { return x + 1 }\n// trailing comment\n\n"
 	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte(source), 0644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(root, "invalid.go"), []byte("package demo\nfunc broken(\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(root, "routes_test.go"), []byte("package demo\nfunc TestRoute() { router.GET(\"/test\", handler); _ = \"@daily\" }\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	output := filepath.Join(root, "report.json")
@@ -89,14 +86,11 @@ func TestAnalyzerCLIIncludesTrailingLinesAndDiagnostics(t *testing.T) {
 	if err := json.Unmarshal(data, &report); err != nil {
 		t.Fatal(err)
 	}
-	if len(report.Files) != 2 || len(report.Diagnostics) != 1 || report.Diagnostics[0].Path != "invalid.go" {
+	if len(report.Files) != 1 || len(report.Diagnostics) != 1 || report.Diagnostics[0].Path != "invalid.go" {
 		t.Fatalf("hidden root skipped or parse failure omitted: %+v", report)
 	}
-	if len(report.Routes) != 2 || report.Routes[0].IsTest || !report.Routes[1].IsTest || len(report.Crons) != 2 || report.Crons[0].IsTest || !report.Crons[1].IsTest {
-		t.Fatalf("lost test origin: routes=%+v crons=%+v", report.Routes, report.Crons)
-	}
 	file := report.Files[0]
-	if file.LineEnd != 14 || file.ContentHash != fmt.Sprintf("%x", sha256.Sum256([]byte(source))) {
+	if file.LineEnd != 12 || file.ContentHash != fmt.Sprintf("%x", sha256.Sum256([]byte(source))) {
 		t.Fatalf("wrong physical range/hash: %+v", file)
 	}
 	if len(file.BuildConstraints) != 1 {

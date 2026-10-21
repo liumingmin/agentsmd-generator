@@ -172,7 +172,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', default='.')
     parser.add_argument('--ast', action='append', help='索引路径，可重复；相对当前工作目录')
-    parser.add_argument('--doc', action='append', help='只校验指定的 AGENTS 文档，可重复；路径相对项目根')
     parser.add_argument('--strict', action='store_true', help='所有警告也视为失败')
     args = parser.parse_args()
     root = Path(args.root).resolve()
@@ -185,15 +184,6 @@ def main():
         name = p.relative_to(root).as_posix() if p.is_relative_to(root) else str(p)
         reports[name] = json.loads(p.read_text(encoding='utf-8'))
     docs = iter_docs(root)
-    if args.doc:
-        try:
-            selected = sorted({root_path(root, doc).relative_to(root).as_posix() for doc in args.doc})
-        except ValueError as exc:
-            parser.error(str(exc))
-        missing = sorted(set(selected) - set(docs))
-        if missing:
-            parser.error('指定文档不存在或不属于可扫描的 AGENTS 文档: ' + ', '.join(missing))
-        docs = selected
     if not docs:
         parser.error('未找到 AGENTS*.md 文档')
     errors, warnings, checked = validate(root, reports, docs)
