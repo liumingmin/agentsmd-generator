@@ -13,9 +13,11 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/printer"
+	"go/scanner"
 	"go/token"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,17 +26,21 @@ import (
 
 // Symbol 表示一个顶层符号（类型/函数/方法）。
 type Symbol struct {
-	Signature string  `json:"signature,omitempty"`
-	Name      string  `json:"name"`              // 符号名，方法为 Recv.Name
-	Kind      string  `json:"kind"`              // func | method | struct | interface | type | const | var
-	Exported  bool    `json:"exported"`          // 是否导出
-	Line      int     `json:"line"`              // 起始行
-	EndLine   int     `json:"end_line"`          // 结束行
-	Doc       string  `json:"doc,omitempty"`     // 文档注释首行
-	Recv      string  `json:"recv,omitempty"`    // 方法的接收者类型
-	Params    string  `json:"params,omitempty"`  // 参数摘要
-	Results   string  `json:"results,omitempty"` // 返回值摘要
-	Fields    []Field `json:"fields,omitempty"`  // struct 字段 / interface 方法（仅 kind=struct/interface 时输出）
+	ID            string  `json:"id"`
+	ContentHash   string  `json:"content_hash"`
+	BodyHash      string  `json:"body_hash,omitempty"`
+	SignatureHash string  `json:"signature_hash,omitempty"`
+	Signature     string  `json:"signature,omitempty"`
+	Name          string  `json:"name"`              // 符号名，方法为 Recv.Name
+	Kind          string  `json:"kind"`              // func | method | struct | interface | type | const | var
+	Exported      bool    `json:"exported"`          // 是否导出
+	Line          int     `json:"line"`              // 起始行
+	EndLine       int     `json:"end_line"`          // 结束行
+	Doc           string  `json:"doc,omitempty"`     // 文档注释首行
+	Recv          string  `json:"recv,omitempty"`    // 方法的接收者类型
+	Params        string  `json:"params,omitempty"`  // 参数摘要
+	Results       string  `json:"results,omitempty"` // 返回值摘要
+	Fields        []Field `json:"fields,omitempty"`  // struct 字段 / interface 方法（仅 kind=struct/interface 时输出）
 }
 
 // Field 表示结构体字段或接口方法签名。
@@ -49,6 +55,9 @@ type Field struct {
 
 // FileInfo 表示一个 Go 文件。
 type FileInfo struct {
+	TopLevelHash     string   `json:"top_level_hash"`
+	Category         string   `json:"category"`
+	LineQuality      string   `json:"line_quality"`
 	ContentHash      string   `json:"content_hash"`
 	Generated        bool     `json:"generated,omitempty"`
 	BuildConstraints []string `json:"build_constraints,omitempty"`
@@ -96,21 +105,29 @@ type Diagnostic struct {
 
 // Report 是分析结果。
 type Report struct {
-	SchemaVersion int          `json:"schema_version"`
-	Diagnostics   []Diagnostic `json:"diagnostics"`
-	Root          string       `json:"root"`
-	Packages      []PkgInfo    `json:"packages"`
-	Files         []FileInfo   `json:"files"`
-	Routes        []Route      `json:"routes,omitempty"`
-	Crons         []CronJob    `json:"crons,omitempty"`
-	Stats         Stats        `json:"stats"`
+	LocalModules  map[string]string `json:"local_modules"`
+	Scope         json.RawMessage   `json:"scope"`
+	SchemaVersion int               `json:"schema_version"`
+	Diagnostics   []Diagnostic      `json:"diagnostics"`
+	Root          string            `json:"root"`
+	Packages      []PkgInfo         `json:"packages"`
+	Files         []FileInfo        `json:"files"`
+	Routes        []Route           `json:"routes,omitempty"`
+	Crons         []CronJob         `json:"crons,omitempty"`
+	Stats         Stats             `json:"stats"`
 }
 
 // Stats 统计信息。
+type CategoryStats struct {
+	FileCount   int `json:"file_count"`
+	SymbolCount int `json:"symbol_count"`
+}
+
 type Stats struct {
-	FileCount    int `json:"file_count"`
-	PackageCount int `json:"package_count"`
-	SymbolCount  int `json:"symbol_count"`
+	ByCategory   map[string]CategoryStats `json:"by_category"`
+	FileCount    int                      `json:"file_count"`
+	PackageCount int                      `json:"package_count"`
+	SymbolCount  int                      `json:"symbol_count"`
 }
 
 var skipDirs = map[string]bool{
@@ -121,6 +138,7 @@ var skipDirs = map[string]bool{
 func main() {
 	root := flag.String("root", ".", "项目根目录")
 	out := flag.String("out", "", "输出 JSON 文件路径（缺省输出到 stdout）")
+	selectionPath := flag.String("selection", "", "shared selection.json from scanpolicy.py")
 	includeTest := flag.Bool("test", true, "是否包含 _test.go 文件")
 	flag.Parse()
 
@@ -129,11 +147,86 @@ func main() {
 		fatal(err)
 	}
 
+	absRoot, err = filepath.EvalSymlinks(absRoot)
+	if err != nil {
+		fatal(err)
+	}
 	fset := token.NewFileSet()
-	report := &Report{SchemaVersion: 2, Root: filepath.ToSlash(absRoot), Files: []FileInfo{}, Packages: []PkgInfo{}, Diagnostics: []Diagnostic{}}
+	report := &Report{SchemaVersion: 3, Root: filepath.ToSlash(absRoot), Files: []FileInfo{}, Packages: []PkgInfo{}, Diagnostics: []Diagnostic{}}
 	pkgMap := map[string]*PkgInfo{}
 
-	err = filepath.Walk(absRoot, func(path string, info os.FileInfo, err error) error {
+	var selected []string
+	if *selectionPath != "" {
+		var manifest struct {
+			Root  string          `json:"root"`
+			Files []string        `json:"files"`
+			Scope json.RawMessage `json:"scope"`
+		}
+		data, readErr := os.ReadFile(*selectionPath)
+		if readErr != nil {
+			fatal(readErr)
+		}
+		if err := json.Unmarshal(data, &manifest); err != nil {
+			fatal(err)
+		}
+		manifestRoot, _ := filepath.Abs(manifest.Root)
+		manifestRoot, err = filepath.EvalSymlinks(manifestRoot)
+		if err != nil {
+			fatal(err)
+		}
+		if filepath.Clean(manifestRoot) != filepath.Clean(absRoot) {
+			fatal(fmt.Errorf("selection root mismatch"))
+		}
+		sort.Strings(manifest.Files)
+		var scope struct {
+			SelectionHash string `json:"selection_hash"`
+		}
+		if err := json.Unmarshal(manifest.Scope, &scope); err != nil {
+			fatal(err)
+		}
+		if scope.SelectionHash != fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Join(manifest.Files, "\n")))) {
+			fatal(fmt.Errorf("selection hash mismatch"))
+		}
+		seen := map[string]bool{}
+		for _, rel := range manifest.Files {
+			clean := filepath.Clean(filepath.FromSlash(rel))
+			if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) || seen[rel] {
+				fatal(fmt.Errorf("unsafe/duplicate selection path: %s", rel))
+			}
+			seen[rel] = true
+			path := filepath.Join(absRoot, clean)
+			resolved, e := filepath.EvalSymlinks(path)
+			if e != nil {
+				fatal(e)
+			}
+			if resolved != path {
+				fatal(fmt.Errorf("symlink selection path: %s", rel))
+			}
+			if strings.HasSuffix(rel, ".go") {
+				selected = append(selected, path)
+			}
+		}
+		report.Scope = manifest.Scope
+	} else {
+		report.Scope = json.RawMessage(`{"policy":{"mode":"legacy-walk"},"gitignore_applied":false}`)
+		err = filepath.Walk(absRoot, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if info.IsDir() {
+				if path != absRoot && (skipDirs[info.Name()] || strings.HasPrefix(info.Name(), ".")) {
+					return filepath.SkipDir
+				}
+			} else if info.Mode()&os.ModeSymlink == 0 && strings.HasSuffix(info.Name(), ".go") {
+				selected = append(selected, path)
+			}
+			return nil
+		})
+		if err != nil {
+			fatal(err)
+		}
+	}
+	process := func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -149,7 +242,8 @@ func main() {
 		if info.Mode()&os.ModeSymlink != 0 || !strings.HasSuffix(info.Name(), ".go") {
 			return nil
 		}
-		isTest := strings.HasSuffix(info.Name(), "_test.go")
+		relTest, _ := filepath.Rel(absRoot, path)
+		isTest := isTestPath(filepath.ToSlash(relTest))
 		if isTest && !*includeTest {
 			return nil
 		}
@@ -173,8 +267,16 @@ func main() {
 			Package:     f.Name.Name,
 			LineEnd:     physicalLines(source),
 			ContentHash: fmt.Sprintf("%x", sha256.Sum256(source)),
-			Generated:   ast.IsGenerated(f),
+			Generated:   ast.IsGenerated(f) || generatedHeader.Match(source[:min(len(source), 8192)]),
 			IsTest:      isTest,
+			LineQuality: "ast",
+			Category:    "production",
+		}
+		if fi.Generated {
+			fi.Category = "generated"
+		}
+		if fi.IsTest {
+			fi.Category = "test"
 		}
 		for _, group := range f.Comments {
 			for _, comment := range group.List {
@@ -186,6 +288,8 @@ func main() {
 		for _, imp := range f.Imports {
 			fi.Imports = append(fi.Imports, unquote(imp.Path.Value))
 		}
+
+		fi.TopLevelHash = fmt.Sprintf("%x", sha256.Sum256([]byte(fi.Package+"\n"+strings.Join(fi.Imports, "\n"))))
 
 		// 提取路由注册（xxx.POST("/path", handler)）与 cron 表达式
 		ast.Inspect(f, func(n ast.Node) bool {
@@ -212,18 +316,22 @@ func main() {
 			switch d := decl.(type) {
 			case *ast.FuncDecl:
 				s := Symbol{
-					Kind:      "func",
-					Signature: exprString(d.Type),
-					Name:      d.Name.Name,
-					Exported:  ast.IsExported(d.Name.Name),
-					Line:      fset.Position(d.Pos()).Line,
-					EndLine:   fset.Position(d.End()).Line,
-					Doc:       firstLine(d.Doc),
-					Params:    fieldListSummary(d.Type.Params),
-					Results:   fieldListSummary(d.Type.Results),
+					Kind:          "func",
+					Signature:     exprString(d.Type),
+					ContentHash:   fingerprint(d),
+					BodyHash:      bodyFingerprint(d.Body),
+					SignatureHash: fingerprint(d.Type),
+					Name:          d.Name.Name,
+					Exported:      ast.IsExported(d.Name.Name),
+					Line:          fset.Position(d.Pos()).Line,
+					EndLine:       fset.Position(d.End()).Line,
+					Doc:           firstLine(d.Doc),
+					Params:        fieldListSummary(d.Type.Params),
+					Results:       fieldListSummary(d.Type.Results),
 				}
 				if d.Recv != nil && len(d.Recv.List) > 0 {
 					s.Kind = "method"
+					s.SignatureHash = fmt.Sprintf("%x", sha256.Sum256([]byte(s.SignatureHash+fieldListSummary(d.Recv))))
 					s.Recv = recvTypeName(d.Recv.List[0].Type)
 					s.Name = s.Recv + "." + d.Name.Name
 				}
@@ -243,14 +351,16 @@ func main() {
 							fields = interfaceMethods(fset, t)
 						}
 						fi.Symbols = append(fi.Symbols, Symbol{
-							Kind:      kind,
-							Name:      sp.Name.Name,
-							Exported:  ast.IsExported(sp.Name.Name),
-							Line:      fset.Position(sp.Pos()).Line,
-							EndLine:   fset.Position(sp.End()).Line,
-							Doc:       specDoc(sp.Doc, d.Doc),
-							Signature: nodeString(sp),
-							Fields:    fields,
+							Kind:          kind,
+							Name:          sp.Name.Name,
+							Exported:      ast.IsExported(sp.Name.Name),
+							Line:          fset.Position(sp.Pos()).Line,
+							EndLine:       fset.Position(sp.End()).Line,
+							Doc:           specDoc(sp.Doc, d.Doc),
+							Signature:     nodeString(sp),
+							ContentHash:   fingerprint(sp),
+							SignatureHash: fingerprint(sp),
+							Fields:        fields,
 						})
 					case *ast.ValueSpec:
 						kind := "var"
@@ -259,12 +369,14 @@ func main() {
 						}
 						for _, name := range sp.Names {
 							fi.Symbols = append(fi.Symbols, Symbol{
-								Kind:     kind,
-								Name:     name.Name,
-								Exported: ast.IsExported(name.Name),
-								Line:     fset.Position(sp.Pos()).Line,
-								EndLine:  fset.Position(sp.End()).Line,
-								Doc:      specDoc(sp.Doc, d.Doc),
+								Kind:          kind,
+								ContentHash:   fingerprint(sp),
+								SignatureHash: fingerprint(sp),
+								Name:          name.Name,
+								Exported:      ast.IsExported(name.Name),
+								Line:          fset.Position(sp.Pos()).Line,
+								EndLine:       fset.Position(sp.End()).Line,
+								Doc:           specDoc(sp.Doc, d.Doc),
 							})
 						}
 					}
@@ -272,6 +384,12 @@ func main() {
 			}
 		}
 
+		ordinals := map[string]int{}
+		for i := range fi.Symbols {
+			key := fi.Symbols[i].Kind + ":" + fi.Symbols[i].Name
+			fi.Symbols[i].ID = fmt.Sprintf("%s#%d", key, ordinals[key])
+			ordinals[key]++
+		}
 		report.Files = append(report.Files, fi)
 		report.Stats.SymbolCount += len(fi.Symbols)
 
@@ -287,11 +405,21 @@ func main() {
 		}
 		p.Files = append(p.Files, rel)
 		return nil
-	})
-	if err != nil {
-		fatal(err)
+	}
+	for _, path := range selected {
+		info, statErr := os.Lstat(path)
+		if err := process(path, info, statErr); err != nil {
+			fatal(err)
+		}
 	}
 
+	report.Stats.ByCategory = map[string]CategoryStats{"production": {}, "test": {}, "generated": {}}
+	for _, file := range report.Files {
+		count := report.Stats.ByCategory[file.Category]
+		count.FileCount++
+		count.SymbolCount += len(file.Symbols)
+		report.Stats.ByCategory[file.Category] = count
+	}
 	for _, p := range pkgMap {
 		sort.Strings(p.Files)
 		report.Packages = append(report.Packages, *p)
@@ -305,6 +433,7 @@ func main() {
 	sort.Slice(report.Files, func(i, j int) bool { return report.Files[i].Path < report.Files[j].Path })
 	report.Stats.FileCount = len(report.Files)
 	report.Stats.PackageCount = len(report.Packages)
+	report.LocalModules = localModulePaths(absRoot, report.Packages)
 
 	data, err := json.MarshalIndent(report, "", "  ")
 	if err != nil {
@@ -573,4 +702,81 @@ func physicalLines(source []byte) int {
 func fatal(err error) {
 	fmt.Fprintln(os.Stderr, "goast error:", err)
 	os.Exit(1)
+}
+
+// Hash lexical tokens from the AST printer, excluding comments and positions.
+func fingerprint(node ast.Node) string {
+	if node == nil {
+		return ""
+	}
+	text := nodeString(node)
+	var scan scanner.Scanner
+	fset := token.NewFileSet()
+	scan.Init(fset.AddFile("", -1, len(text)), []byte(text), nil, 0)
+	var normalized strings.Builder
+	for {
+		_, tok, lit := scan.Scan()
+		if tok == token.EOF {
+			break
+		}
+		if tok == token.SEMICOLON {
+			lit = ";"
+		}
+		fmt.Fprintf(&normalized, "%d:%q|", tok, lit)
+	}
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(normalized.String())))
+}
+
+func bodyFingerprint(body *ast.BlockStmt) string {
+	if body == nil {
+		return ""
+	}
+	return fingerprint(body)
+}
+
+var generatedHeader = regexp.MustCompile(`(?im)^.{0,10}(?:Code generated\b[^\n]*DO NOT EDIT|@generated\b)`)
+
+func isTestPath(path string) bool {
+	parts := strings.Split(path, "/")
+	for _, part := range parts[:len(parts)-1] {
+		switch strings.ToLower(part) {
+		case "test", "tests", "__tests__", "testdata":
+			return true
+		}
+	}
+	name := parts[len(parts)-1]
+	return strings.HasPrefix(name, "test_") || strings.HasSuffix(name, "_test.go") || strings.Contains(name, ".test.") || strings.Contains(name, ".spec.")
+}
+
+// Save module identities with the snapshot so old import edges survive module renames.
+func localModulePaths(root string, packages []PkgInfo) map[string]string {
+	result := map[string]string{}
+	checked := map[string]bool{}
+	for _, pkg := range packages {
+		current := filepath.Join(root, filepath.FromSlash(pkg.Dir))
+		for {
+			rel, err := filepath.Rel(root, current)
+			if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				break
+			}
+			if checked[current] {
+				break
+			}
+			checked[current] = true
+			if data, err := os.ReadFile(filepath.Join(current, "go.mod")); err == nil {
+				for _, line := range strings.Split(string(data), "\n") {
+					fields := strings.Fields(strings.SplitN(line, "//", 2)[0])
+					if len(fields) >= 2 && fields[0] == "module" {
+						result[filepath.ToSlash(rel)] = strings.Trim(fields[1], "\"")
+						break
+					}
+				}
+			}
+			if current == root {
+				break
+			}
+			current = filepath.Dir(current)
+		}
+	}
+	return result
 }

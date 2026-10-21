@@ -7,15 +7,10 @@ hashes allow diff.py to detect changes in config, CI, docs and manifests too.
 import argparse
 import hashlib
 import json
-import os
 import re
 from pathlib import Path
+from scanpolicy import SOURCE_EXTS, is_test, classify, counts, load_selection, add_arguments, from_args
 
-SKIP_DIRS = {'.git', '.agentsmd', '.workbuddy', 'node_modules', 'vendor', 'dist',
-             'build', 'target', '__pycache__', '.venv', 'venv', 'coverage'}
-SOURCE_EXTS = {'.go', '.py', '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.java',
-               '.kt', '.rs', '.c', '.h', '.cc', '.cpp', '.hpp', '.sql', '.proto',
-               '.sh', '.bash', '.rb', '.php', '.cs'}
 MANIFESTS = {'go.mod', 'go.work', 'package.json', 'pnpm-workspace.yaml',
              'requirements.txt', 'pyproject.toml', 'Pipfile', 'Cargo.toml',
              'pom.xml', 'build.gradle', 'build.gradle.kts', 'Gemfile', 'composer.json'}
@@ -26,11 +21,6 @@ ENTRY_NAMES = {'main.go', 'main.py', 'main.rs', 'manage.py', '__main__.py',
                'index.ts', 'index.js', 'main.ts', 'main.js', 'app.py', 'server.ts',
                'server.js', 'server.py', 'wsgi.py', 'asgi.py', 'Program.cs'}
 
-
-def is_test(path):
-    p = Path(path)
-    return (any(part.lower() in {'test', 'tests', '__tests__'} for part in p.parts[:-1])
-            or bool(re.search(r'(^test_|_test\.|\.test\.|\.spec\.|Tests?\.(java|kt)$)', p.name)))
 
 
 def categories(path):
@@ -103,67 +93,57 @@ def manifest_facts(path, text):
     return facts
 
 
-def scan(root, max_bytes=2_000_000):
+def scan(root, max_bytes=2_000_000, selection=None):
     root = Path(root).resolve()
     if not root.is_dir():
         raise ValueError(f'Not a directory: {root}')
-    files, diagnostics, grouped, dirs = [], [], {}, {}
-    def walk_error(exc):
-        diagnostics.append({'path': str(exc.filename), 'reason': str(exc)})
-
-    for current, names, filenames in os.walk(root, onerror=walk_error):
-        names[:] = sorted(n for n in names if n not in SKIP_DIRS
-                          and (not n.startswith('.') or n in {'.github', '.circleci'}))
-        for name in sorted(filenames):
-            path = Path(current) / name
-            rel = path.relative_to(root).as_posix()
-            if re.fullmatch(r'(?i)agents(?:\..+)?\.md', name):
-                continue  # Generated guides must not invalidate their own snapshot.
-            if path.is_symlink():
-                diagnostics.append({'path': rel, 'reason': 'symlink not followed'})
-                continue
-            tags = categories(rel)
-            record = {'path': rel, 'categories': tags}
-            try:
-                size = path.stat().st_size
-                record['size_bytes'] = size
-                if size > max_bytes:
-                    diagnostics.append({'path': rel, 'reason': 'size limit; content not inspected'})
-                else:
-                    raw = path.read_bytes()
-                    record['content_hash'] = hashlib.sha256(raw).hexdigest()
-                    text = raw.decode('utf-8-sig') if tags != ['other'] else ''
-                    record['line_end'] = len(text.splitlines())
-                    if tags == ['other']:
-                        del record['line_end']
-                    if '\x00' in text:
-                        raise ValueError('binary content in a text asset; not inspected')
-                    if 'manifest' in tags or 'build_deploy' in tags:
-                        record['facts'] = manifest_facts(rel, text)
-                    if 'source' in tags and re.search(r'(?m)^\s*(?:func main\(|if __name__\s*==)', text):
-                        if 'entrypoint_candidate' not in tags:
-                            tags.append('entrypoint_candidate')
-                    # Include names only: actual credentials and environment values stay out of the report.
-                    if name.startswith('.env'):
-                        record['environment_keys'] = [
-                            {'name': m.group(1), 'line': n}
-                            for n, line in enumerate(text.splitlines(), 1)
-                            if (m := re.match(r'\s*(?:export\s+)?([A-Za-z_]\w*)\s*=', line))]
-            except (OSError, UnicodeError, ValueError) as exc:
-                diagnostics.append({'path': rel, 'reason': str(exc)})
-            files.append(record)
-            for tag in tags:
-                grouped.setdefault(tag, []).append(rel)
-            directory = rel.split('/')[0] if '/' in rel else '.'
-            summary = dirs.setdefault(directory, {'files': 0, 'source_files': 0, 'test_files': 0})
-            summary['files'] += 1
-            summary['source_files'] += int('source' in tags)
-            summary['test_files'] += int('test' in tags)
+    selection = load_selection(root, selection)
+    files, diagnostics, grouped, dirs = [], list(selection['diagnostics']), {}, {}
+    for rel in selection['files']:
+        path = root / rel
+        name = path.name
+        tags = categories(rel)
+        record = {'path': rel, 'categories': tags}
+        text = ''
+        try:
+            size = path.stat().st_size
+            record['size_bytes'] = size
+            if size > max_bytes:
+                diagnostics.append({'path': rel, 'reason': 'size limit; content not inspected'})
+            else:
+                raw = path.read_bytes()
+                record['content_hash'] = hashlib.sha256(raw).hexdigest()
+                text = raw.decode('utf-8-sig') if tags != ['other'] else ''
+                if tags != ['other']:
+                    record['line_end'] = len(raw.splitlines())
+                if '\x00' in text:
+                    raise ValueError('binary content in a text asset; not inspected')
+                if 'manifest' in tags or 'build_deploy' in tags:
+                    record['facts'] = manifest_facts(rel, text)
+                if 'source' in tags and re.search(r'(?m)^\s*(?:func main\(|if __name__\s*==)', text):
+                    if 'entrypoint_candidate' not in tags:
+                        tags.append('entrypoint_candidate')
+                if name.startswith('.env'):
+                    record['environment_keys'] = [
+                        {'name': m.group(1), 'line': n}
+                        for n, line in enumerate(text.splitlines(), 1)
+                        if (m := re.match(r'\s*(?:export\s+)?([A-Za-z_]\w*)\s*=', line))]
+        except (OSError, UnicodeError, ValueError) as exc:
+            diagnostics.append({'path': rel, 'reason': str(exc)})
+        record.update(classify(rel, text))
+        files.append(record)
+        for tag in tags:
+            grouped.setdefault(tag, []).append(rel)
+        directory = rel.split('/')[0] if '/' in rel else '.'
+        summary = dirs.setdefault(directory, {'files': 0, 'source_files': 0, 'test_files': 0})
+        summary['files'] += 1
+        summary['source_files'] += int('source' in tags)
+        summary['test_files'] += int('test' in tags)
     files.sort(key=lambda f: f['path'])
-    return {'schema_version': 2, 'root': str(root), 'files': files,
+    return {'schema_version': 3, 'root': str(root), 'scope': selection['scope'], 'files': files,
             'categories': {k: sorted(v) for k, v in sorted(grouped.items())},
             'directories': dict(sorted(dirs.items())),
-            'stats': {'file_count': len(files), **{k + '_count': len(v) for k, v in sorted(grouped.items())}},
+            'stats': {'file_count': len(files), 'by_category': counts(f for f in files if 'source' in f['categories']), **{k + '_count': len(v) for k, v in sorted(grouped.items())}},
             'diagnostics': diagnostics,
             'limitations': ['Categories and entrypoints are candidates; verify behavior in source.',
                             'Facts are extracted only for package.json, go.mod and build target candidates.',
@@ -175,9 +155,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', default='.')
     parser.add_argument('--out')
+    add_arguments(parser)
     args = parser.parse_args()
     try:
-        report = scan(args.root)
+        report = scan(args.root, selection=from_args(args))
     except ValueError as exc:
         parser.error(str(exc))
     data = json.dumps(report, ensure_ascii=False, indent=2)

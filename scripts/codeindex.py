@@ -1,15 +1,8 @@
 #!/usr/bin/env python3
-"""codeindex: 多语言静态索引器（Python AST，其余语言正则）。
-
-对非 Go 语言（TS/JS/Python/Java/Kotlin/Rust/C/C++/SQL/proto/shell）扫描
-符号与目录分组，输出与 goast 对齐的 JSON。Python 用标准库 AST 精确提取，
-其余语言只提供候选声明行，复杂嵌套场景可能遗漏；Go 代码请用 goast。
-
-用法:
-    python codeindex.py --root <项目根> [--out <输出.json>] [--ext .ts,.py]
-"""
+"""Multilanguage index: Python AST, optional TypeScript AST, explicit regex fallback."""
 import argparse
 import ast
+import copy
 import hashlib
 import json
 import os
@@ -17,11 +10,15 @@ import re
 import sys
 import io
 import tokenize
+import subprocess
+from pathlib import Path
+from scanpolicy import (classify, counts, digest, finalize_symbols, load_selection,
+                        add_arguments, from_args)
 
 # 每种语言: (扩展名集合, [ (kind, 正则, name组) ])
 RULES = {
     "typescript": (
-        {".ts", ".tsx"},
+        {".ts", ".tsx", ".mts", ".cts"},
         [
             ("class", re.compile(r"^\s*(?:export\s+)?(?:abstract\s+)?class\s+(\w+)"), 1),
             ("interface", re.compile(r"^\s*(?:export\s+)?interface\s+(\w+)"), 1),
@@ -119,6 +116,21 @@ def python_index(text):
                 if kind != "class":
                     symbol["params"] = ast.unparse(node.args)
                     symbol["results"] = ast.unparse(node.returns) if node.returns else ""
+                symbol["content_hash"] = digest(ast.dump(node, include_attributes=False))
+                contract = copy.deepcopy(node)
+                if kind == "class":
+                    for child in contract.body:
+                        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            child.body = []
+                else:
+                    contract.body = []
+                symbol["signature_hash"] = digest(ast.dump(contract, include_attributes=False))
+                if kind != "class":
+                    symbol["signature"] = ast.dump(node.args, include_attributes=False) + (ast.dump(node.returns, include_attributes=False) if node.returns else "")
+                    body = node.body
+                    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) and isinstance(body[0].value.value, str):
+                        body = body[1:]
+                    symbol["body_hash"] = digest("\n".join(ast.dump(part, include_attributes=False) for part in body))
                 symbols.append(symbol)
                 if kind == "class":
                     declarations(node.body, name + ".", True)
@@ -136,6 +148,8 @@ def python_index(text):
             imports.extend(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
             imports.append("." * node.level + (node.module or ""))
+            if node.module is None:
+                imports.extend("." * node.level + alias.name for alias in node.names if alias.name != "*")
     return sorted(symbols, key=lambda s: (s["line"], s["name"])), sorted(set(imports))
 
 
@@ -159,9 +173,10 @@ def scan_file(path, rel, lang, rules):
         "line_end": len(lines),
         "content_hash": hashlib.sha256(raw).hexdigest(),
         "imports": imports,
-        "symbols": symbols,
-        "is_test": bool(re.search(r"(^test_|_test\.|\.test\.|\.spec\.|Tests?\.)", os.path.basename(path)))
-                   or any(p in {"test", "tests", "__tests__"} for p in rel.split("/")[:-1]),
+        "top_level_hash": digest(ast.dump(ast.Module(body=[n for n in ast.parse(text).body if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))], type_ignores=[]), include_attributes=False)) if lang == "python" else None,
+        "symbols": finalize_symbols(symbols),
+        **classify(rel, text),
+        "parser": {"name": "python-ast" if lang == "python" else "regex"},
         "line_quality": "ast" if lang == "python" else "approximate",
     }
 
@@ -199,74 +214,83 @@ def regex_index(lines, rules, lang):
     return symbols
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--root", default=".")
-    ap.add_argument("--out", default="")
-    ap.add_argument("--ext", default="", help="逗号分隔的扩展名白名单，如 .ts,.py；缺省全部支持")
-    args = ap.parse_args()
-
-    allow = None
-    if args.ext:
-        allow = {"." + e.strip().lower().lstrip(".") for e in args.ext.split(",") if e.strip()}
-
-    root = os.path.abspath(args.root)
-    if not os.path.isdir(root):
-        ap.error(f"not a directory: {root}")
-    files = []
-    diagnostics = []
-    def walk_error(exc):
-        diagnostics.append({"path": str(exc.filename), "reason": str(exc)})
-
-    for dirpath, dirnames, filenames in os.walk(root, onerror=walk_error):
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
-        for fn in filenames:
-            ext = os.path.splitext(fn)[1].lower()
-            lang = EXT2LANG.get(ext)
-            if not lang or (allow and ext not in allow):
-                continue
-            full = os.path.join(dirpath, fn)
-            rel = os.path.relpath(full, root).replace(os.sep, "/")
-            _, rules = RULES[lang]
-            if os.path.islink(full):
-                diagnostics.append({"path": rel, "reason": "symlink not followed"})
-                continue
-            try:
-                info = scan_file(full, rel, lang, rules)
-            except (ValueError, SyntaxError, OSError) as exc:
-                diagnostics.append({"path": rel, "reason": str(exc)})
-                continue
-            if info:
-                files.append(info)
-
-    files.sort(key=lambda x: x["path"])
+def scan(root, selection=None, allow=None, js_parser="auto", typescript=None, node="node"):
+    root = Path(root).resolve()
+    selection = load_selection(root, selection)
+    files, diagnostics, notices = [], list(selection["diagnostics"]), []
+    paths = [p for p in selection["files"] if Path(p).suffix.lower() in EXT2LANG
+             and (not allow or Path(p).suffix.lower() in allow)]
+    js_paths = [p for p in paths if EXT2LANG[Path(p).suffix.lower()] in {"typescript", "javascript"}]
+    parsed_js = False
+    if js_paths and js_parser != "regex":
+        payload = {"root": str(root), "files": js_paths, "typescript": typescript}
+        try:
+            run = subprocess.run([node, str(Path(__file__).with_name("jsindex.cjs"))],
+                                 input=json.dumps(payload), text=True, capture_output=True, timeout=180)
+            result = json.loads(run.stdout) if run.stdout else {}
+            if run.returncode:
+                raise ValueError(result.get("unavailable") or run.stderr or "JS parser failed")
+            diagnostics.extend(result.get("diagnostics", []))
+            parsed_files = []
+            for file in result["files"]:
+                file.update(classify(file["path"], (root / file["path"]).read_text(encoding="utf-8-sig")))
+                finalize_symbols(file["symbols"])
+                parsed_files.append(file)
+            files.extend(parsed_files)
+            parsed_js = True
+        except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+            if js_parser == "typescript":
+                raise ValueError(f"TypeScript AST required: {exc}") from exc
+            notices.append(f"JS/TS regex fallback: {exc}")
+    for rel in paths:
+        lang = EXT2LANG[Path(rel).suffix.lower()]
+        if parsed_js and rel in js_paths:
+            continue
+        try:
+            files.append(scan_file(root / rel, rel, lang, RULES[lang][1]))
+        except (ValueError, SyntaxError, OSError) as exc:
+            diagnostics.append({"path": rel, "reason": str(exc)})
+    files.sort(key=lambda f: f["path"])
     groups = {}
-    for f in files:
-        groups.setdefault((f["package"], f["language"]), []).append(f["path"])
+    for file in files:
+        groups.setdefault((file["package"], file["language"]), []).append(file["path"])
     packages = [{"dir": directory, "package": directory or ".", "language": language, "files": paths}
                 for (directory, language), paths in sorted(groups.items())]
-    report = {
-        "schema_version": 2,
-        "root": root.replace(os.sep, "/"),
-        "packages": packages,
-        "files": files,
-        "stats": {
-            "file_count": len(files),
-            "package_count": len(packages),
-            "symbol_count": sum(len(f["symbols"]) for f in files),
-        },
-        "diagnostics": diagnostics,
-        "note": "Python uses ast; other languages use regex with declaration-only ranges and unknown exported flags. Verify semantics in source.",
-    }
-    data = json.dumps(report, ensure_ascii=False, indent=2)
+    return {"schema_version": 3, "root": str(root), "scope": selection["scope"],
+            "packages": packages, "files": files,
+            "stats": {"file_count": len(files), "package_count": len(packages),
+                      "symbol_count": sum(len(f["symbols"]) for f in files), "by_category": counts(files)},
+            "diagnostics": diagnostics, "notices": notices,
+            "limitations": ["Syntax-only indexing; exports do not establish a runtime contract.",
+                            "Regex files have declaration-only ranges and no semantic fingerprints."]}
+
+
+def parser_arguments(ap):
+    ap.add_argument("--js-parser", choices=["auto", "typescript", "regex"], default="auto")
+    ap.add_argument("--typescript", help="local TypeScript compiler module directory or typescript.js")
+    ap.add_argument("--node", default="node")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--root", default=".")
+    ap.add_argument("--out")
+    ap.add_argument("--ext", default="", help="extension whitelist, e.g. .ts,.py")
+    add_arguments(ap)
+    parser_arguments(ap)
+    args = ap.parse_args()
+    allow = {"." + e.strip().lower().lstrip(".") for e in args.ext.split(",") if e.strip()}
+    try:
+        report = scan(args.root, from_args(args), allow, args.js_parser, args.typescript, args.node)
+    except ValueError as exc:
+        ap.error(str(exc))
+    data = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
     if args.out:
-        os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
-        with open(args.out, "w", encoding="utf-8") as fh:
-            fh.write(data)
-        print(f"codeindex: {report['stats']['file_count']} files, "
-              f"{report['stats']['symbol_count']} symbols -> {args.out}", file=sys.stderr)
+        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.out).write_text(data, encoding="utf-8")
+        print(f"codeindex: {report['stats']['file_count']} files -> {args.out}", file=sys.stderr)
     else:
-        print(data)
+        print(data, end="")
 
 
 if __name__ == "__main__":

@@ -30,7 +30,13 @@ def import_edges(report, root, module=''):
     for directory in sorted(packages):
         current = root / directory
         while current.is_relative_to(root):
-            prefix = module if current == root and module else detect_module(current)
+            directory_key = current.relative_to(root).as_posix()
+            if current == root and module:
+                prefix = module
+            elif 'local_modules' in report:
+                prefix = report['local_modules'].get(directory_key, '')
+            else:
+                prefix = detect_module(current)
             if prefix:
                 suffix = (root / directory).relative_to(current).as_posix()
                 mapping[prefix + ('/' + suffix if suffix != '.' else '')] = directory
@@ -47,6 +53,48 @@ def import_edges(report, root, module=''):
             if imp in mapping and mapping[imp] != src:
                 edges[src].add(mapping[imp])
     return edges
+
+
+def file_dependencies(report, root):
+    """Return file import dependencies and unresolved imports, never runtime calls."""
+    root = Path(root).resolve()
+    files = {f['path']: f for f in report.get('files') or []}
+    edges, unresolved = defaultdict(set), []
+    packages = defaultdict(set)
+    for path in files:
+        if path.endswith('.go'): packages[Path(path).parent.as_posix()].add(path)
+    go_edges = import_edges(report, root)
+    js_exts = ('.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs')
+    for path, file in files.items():
+        directory = Path(path).parent.as_posix()
+        if path.endswith('.go'):
+            edges[path].update(packages[directory] - {path})  # implicit same-package references
+            for target in go_edges.get(directory, []): edges[path].update(packages[target])
+            continue
+        for imp in file.get('imports') or []:
+            candidates = []
+            if Path(path).suffix in js_exts and imp.startswith('.'):
+                base = (root / Path(path).parent / imp).resolve()
+                if base.is_relative_to(root):
+                    rel = base.relative_to(root).as_posix()
+                    candidates = [rel] + [rel + ext for ext in js_exts] + [rel + '/index' + ext for ext in js_exts]
+                    # NodeNext source commonly imports emitted .js paths from .ts source.
+                    if base.suffix in ('.js', '.mjs', '.cjs'):
+                        candidates += [str(Path(rel).with_suffix(ext)) for ext in ('.ts', '.tsx', '.mts', '.cts')]
+            elif path.endswith('.py'):
+                level = len(imp) - len(imp.lstrip('.'))
+                base = root / Path(path).parent if level else root
+                for _ in range(max(0, level - 1)): base = base.parent
+                base = base / imp.lstrip('.').replace('.', '/')
+                if base.resolve().is_relative_to(root):
+                    rel = base.resolve().relative_to(root).as_posix()
+                    candidates = [rel + '.py', rel + '/__init__.py']
+            found = [candidate for candidate in candidates if candidate in files]
+            if found:
+                edges[path].add(found[0])
+            else:
+                unresolved.append({'file': path, 'import': imp, 'reason': 'external, alias, dynamic or outside indexed scope'})
+    return edges, unresolved
 
 
 def main():

@@ -70,6 +70,8 @@ def validate(root, reports, docs):
         declared_root = report.get('root')
         if declared_root and Path(declared_root).resolve() != root:
             warnings.append(f'{source}: 索引 root 与项目根不同，请确认索引已重建')
+        for notice in report.get('notices', []):
+            warnings.append(f'{source}: {notice}')
         if report.get('diagnostics'):
             warnings.append(f'{source}: 有 {len(report["diagnostics"])} 个文件未完整分析，请检查 diagnostics')
         for file in report.get('files') or []:
@@ -154,7 +156,7 @@ def validate(root, reports, docs):
                 spec = json.loads(match.group(1))
                 source = spec['source']
                 stats = reports[source]['stats']
-                for key in ('file_count', 'package_count', 'symbol_count'):
+                for key in ('file_count', 'package_count', 'symbol_count', 'by_category'):
                     if key in spec and spec[key] != stats.get(key):
                         errors.append(f'{md}: {source} 的 {key} 文档值 {spec[key]} != 索引值 {stats.get(key)}')
             except (KeyError, ValueError, TypeError) as exc:
@@ -172,6 +174,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', default='.')
     parser.add_argument('--ast', action='append', help='索引路径，可重复；相对当前工作目录')
+    parser.add_argument('--modules', help='module map; default discovered .agentsmd/modules.json')
+    parser.add_argument('--evidence', help='evidence ledger; default discovered .agentsmd/evidence.json')
+    parser.add_argument('--require-reviewed', action='store_true', help='require module review and behavioral evidence')
     parser.add_argument('--strict', action='store_true', help='所有警告也视为失败')
     args = parser.parse_args()
     root = Path(args.root).resolve()
@@ -183,10 +188,47 @@ def main():
         p = Path(path).resolve()
         name = p.relative_to(root).as_posix() if p.is_relative_to(root) else str(p)
         reports[name] = json.loads(p.read_text(encoding='utf-8'))
-    docs = iter_docs(root)
+    from artifacts import read_json, load_reports
+    module_path = Path(args.modules) if args.modules else root / '.agentsmd/modules.json'
+    evidence_path = Path(args.evidence) if args.evidence else root / '.agentsmd/evidence.json'
+    mapping = read_json(module_path) if module_path.exists() else None
+    if mapping:
+        # A reviewed map selects delivered guides; unrelated instruction/template files keep their role.
+        docs = sorted({m['document'] for m in mapping['modules']})
+    else:
+        docs = iter_docs(root)
+    missing_docs = [md for md in docs if not root_path(root, md).is_file()]
+    docs = [md for md in docs if md not in missing_docs]
     if not docs:
         parser.error('未找到 AGENTS*.md 文档')
     errors, warnings, checked = validate(root, reports, docs)
+    errors.extend(f'missing module document: {md}' for md in missing_docs)
+    try:
+        if mapping:
+            import modules
+            all_reports = load_reports(root, paths + ([str(root / '.agentsmd/context.json')] if (root / '.agentsmd/context.json').exists() else []))
+            errs, warns = modules.check(root, mapping, all_reports, require_reviewed=args.require_reviewed)
+            errors.extend(errs); warnings.extend(warns)
+            if evidence_path.exists():
+                import evidence
+                errs, warns = evidence.check(root, read_json(evidence_path), mapping, all_reports, args.require_reviewed)
+                errors.extend(errs); warnings.extend(warns)
+            elif args.require_reviewed:
+                errors.append('required evidence ledger missing')
+        elif args.modules or args.require_reviewed or evidence_path.exists():
+            errors.append('module map missing; required for evidence/review checks')
+        if args.evidence and not evidence_path.exists(): errors.append('specified evidence ledger missing')
+        # Detect added/deleted/ignored sources as well as stale existing hashes.
+        scoped = [report for report in reports.values() if report.get('scope', {}).get('selection_hash')]
+        if scoped:
+            from scanpolicy import select_files
+            for report in scoped:
+                policy = report['scope']['policy']
+                current = select_files(root, policy['exclude'], policy['respect_gitignore'])
+                if current['scope'] != report['scope']:
+                    errors.append('analysis selection is stale; rerun analyze.py and reconcile modules')
+    except (OSError, ValueError, KeyError) as exc:
+        errors.append(str(exc))
     print(f'[verify] 索引 {len(reports)} 份，文档 {len(docs)} 个，引用检查 {checked} 处')
     for warning in warnings:
         print('  WARN ' + warning)
