@@ -1,161 +1,127 @@
 #!/usr/bin/env python3
-"""diff: 对比新旧两份 ast.json，输出增量更新报告。
+"""Compare code indexes or projectcontext snapshots, including file content.
 
-报告内容：
-1. 符号变化 —— 新增 / 删除 / 行号偏移 / 签名(params/results)变化
-2. 结构体字段变化 —— 字段新增 / 删除 / 行号偏移
-3. 路由与 cron 变化
-4. 受影响文档清单 —— 扫描 AGENTS*.md，列出哪些文档引用了变化的
-   文件与行号区间，直接给出"需要人工复核的引用位置"
-
-用法:
-    # 代码变动后：先备份旧分析，再重跑 goast，最后 diff
-    cp .agentsmd/ast.json .agentsmd/ast.old.json
-    goast.exe -root . -out .agentsmd/ast.json
-    python diff.py --old .agentsmd/ast.old.json --new .agentsmd/ast.json [--root .]
+Usage: python diff.py --old old.json --new new.json --root <project>
+The tool reports evidence requiring review. It never decides that prose is
+semantically up to date merely because symbols have the same signatures.
 """
 import argparse
-import glob
 import json
-import os
 import re
+from pathlib import Path
+from verify import REF_PAT, LINK_PAT, iter_docs, local_link_target, without_fences
 
 
-def index_symbols(ast):
-    """(file, name, kind) -> symbol"""
-    out = {}
-    for f in ast["files"]:
-        for s in f.get("symbols") or []:
-            out[(f["path"], s["name"], s["kind"])] = s
-    return out
+def index_symbols(report):
+    return {(f['path'], s['name'], s['kind']): s
+            for f in report.get('files') or [] for s in f.get('symbols') or []}
 
 
-def sig(s):
-    return (s.get("params", ""), s.get("results", ""))
+def compare(old, new):
+    old_files = {f['path']: f for f in old.get('files') or []}
+    new_files = {f['path']: f for f in new.get('files') or []}
+    changes = []
+    unknown = []
+    for path in sorted(old_files.keys() | new_files.keys()):
+        before, after = old_files.get(path), new_files.get(path)
+        reasons = []
+        if before is None:
+            reasons.append('新增文件')
+        elif after is None:
+            reasons.append('删除文件')
+        else:
+            if not before.get('content_hash') or not after.get('content_hash'):
+                unknown.append(path)
+            elif before['content_hash'] != after['content_hash']:
+                reasons.append('内容变化（含函数体、注释或配置，需复核行为）')
+            for key, label in [('imports', 'imports'), ('line_end', '文件行数'), ('size_bytes', '文件大小'),
+                               ('facts', 'manifest 事实'), ('categories', '资产分类'),
+                               ('build_constraints', '构建条件'), ('generated', '生成代码标记')]:
+                if before.get(key) != after.get(key):
+                    reasons.append(label + '变化')
+            osym = {(s['name'], s['kind']): s for s in before.get('symbols') or []}
+            nsym = {(s['name'], s['kind']): s for s in after.get('symbols') or []}
+            for key in sorted(osym.keys() | nsym.keys()):
+                a, b = osym.get(key), nsym.get(key)
+                name = key[0]
+                if a is None:
+                    reasons.append(f'新增符号 {name}:L{b["line"]}')
+                elif b is None:
+                    reasons.append('删除符号 ' + name)
+                elif a != b:
+                    details = []
+                    if (a.get('line'), a.get('end_line')) != (b.get('line'), b.get('end_line')):
+                        details.append(f'行号 L{a["line"]} -> L{b["line"]}-L{b["end_line"]}')
+                    for keys, label in [(('signature', 'params', 'results', 'exported'), '签名/可见性'),
+                                        (('fields',), '字段（含类型/tag/行号）'), (('doc',), '注释')]:
+                        if any(a.get(k) != b.get(k) for k in keys):
+                            details.append(label)
+                    reasons.append(f'符号 {name} 变化: ' + ('、'.join(details) or '索引元数据'))
+        if reasons:
+            changes.append({'path': path, 'reasons': reasons})
+    for kind, label in [('routes', '路由候选'), ('crons', 'cron 候选')]:
+        before = {json.dumps(x, sort_keys=True, ensure_ascii=False) for x in old.get(kind) or []}
+        after = {json.dumps(x, sort_keys=True, ensure_ascii=False) for x in new.get(kind) or []}
+        for value in sorted(before ^ after):
+            entry = json.loads(value)
+            changes.append({'path': entry['file'], 'reasons': [
+                f'{label}{"新增/变更" if value in after else "删除/变更"}: {value}']})
+    return changes, unknown
+
+
+def affected_docs(root, changed):
+    affected = {}
+    for md in iter_docs(root):
+        text = without_fences((root / md).read_text(encoding='utf-8'))
+        hits = []
+        for n, line in enumerate(text.splitlines(), 1):
+            refs = {m.group(1).replace('\\', '/') for m in REF_PAT.finditer(line)}
+            for match in LINK_PAT.finditer(line):
+                target = local_link_target(md, match.group(2))
+                if target is not None:
+                    refs.add(Path(target).as_posix())
+                    try:
+                        refs.add((root / target).resolve().relative_to(root).as_posix())
+                    except ValueError:
+                        pass
+            matches = changed & refs
+            if matches:
+                hits.append((n, ', '.join(sorted(matches))))
+        if hits:
+            affected[md] = hits
+    return affected
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--old", required=True)
-    ap.add_argument("--new", required=True)
-    ap.add_argument("--root", default=".")
-    args = ap.parse_args()
-
-    old = json.load(open(args.old, encoding="utf-8"))
-    new = json.load(open(args.new, encoding="utf-8"))
-    osym, nsym = index_symbols(old), index_symbols(new)
-
-    added, removed, moved, sigchanged, fieldchanges = [], [], [], [], []
-
-    for key, s in nsym.items():
-        o = osym.get(key)
-        if not o:
-            added.append(key)
-            continue
-        if (s["line"], s["end_line"]) != (o["line"], o["end_line"]):
-            moved.append((key, o["line"], s["line"], s["end_line"]))
-        if sig(s) != sig(o):
-            sigchanged.append(key)
-        # 字段级对比
-        of = {fd["name"]: fd for fd in o.get("fields", [])}
-        nf = {fd["name"]: fd for fd in s.get("fields", [])}
-        fadd = [n for n in nf if n not in of]
-        fdel = [n for n in of if n not in nf]
-        fmove = [n for n in nf if n in of and nf[n]["line"] != of[n]["line"]]
-        if fadd or fdel or fmove:
-            fieldchanges.append((key, fadd, fdel, fmove, nf))
-
-    for key in osym:
-        if key not in nsym:
-            removed.append(key)
-
-    # 路由 / cron 变化
-    def route_key(r):
-        return (r["method"], r["path"], r["handler"])
-    oroutes = {route_key(r) for r in old.get("routes", [])}
-    nroutes = {route_key(r) for r in new.get("routes", [])}
-    ocrons = {(c["file"], c["expr"]) for c in old.get("crons", [])}
-    ncrons = {(c["file"], c["expr"]) for c in new.get("crons", [])}
-
-    print("# 增量更新报告\n")
-    print(f"符号: 新增 {len(added)} / 删除 {len(removed)} / 行号偏移 {len(moved)} / 签名变化 {len(sigchanged)} / 字段变化 {len(fieldchanges)}\n")
-
-    if added:
-        print("## 新增符号\n")
-        for f, n, k in sorted(added):
-            s = nsym[(f, n, k)]
-            print(f"- + `{n}` ({k}) [{f}:L{s['line']}]({f})")
-
-    if removed:
-        print("\n## 删除符号（文档中相关引用需移除）\n")
-        for f, n, k in sorted(removed):
-            print(f"- - `{n}` ({k}) {f}")
-
-    if moved:
-        print("\n## 行号偏移（文档引用需更新）\n")
-        for (f, n, k), ol, nl, ne in sorted(moved):
-            print(f"- `{n}` ({k}) {f}: L{ol} -> L{nl}-L{ne}")
-
-    if sigchanged:
-        print("\n## 签名变化（功能描述可能需改写）\n")
-        for f, n, k in sorted(sigchanged):
-            s = nsym[(f, n, k)]
-            print(f"- `{n}` ({k}) [{f}:L{s['line']}]({f})  新签名: ({s.get('params','')}) -> ({s.get('results','')})")
-
-    if fieldchanges:
-        print("\n## 结构体字段变化\n")
-        for (f, n, k), fadd, fdel, fmove, nf in sorted(fieldchanges):
-            parts = []
-            if fadd:
-                parts.append("新增 " + ", ".join(f"`{x}`(L{nf[x]['line']})" for x in fadd))
-            if fdel:
-                parts.append("删除 " + ", ".join(f"`{x}`" for x in fdel))
-            if fmove:
-                parts.append("偏移 " + ", ".join(f"`{x}`->L{nf[x]['line']}" for x in fmove))
-            print(f"- `{n}` [{f}]({f}): " + "；".join(parts))
-
-    radd, rdel = nroutes - oroutes, oroutes - nroutes
-    if radd or rdel:
-        print("\n## 路由变化\n")
-        for m, p, h in sorted(radd):
-            print(f"- + {m} {p} -> {h}")
-        for m, p, h in sorted(rdel):
-            print(f"- - {m} {p} -> {h}")
-
-    cadd, cdel = ncrons - ocrons, ocrons - ncrons
-    if cadd or cdel:
-        print("\n## cron 变化\n")
-        for f, e in sorted(cadd):
-            print(f"- + `{e}` ({f})")
-        for f, e in sorted(cdel):
-            print(f"- - `{e}` ({f})")
-
-    # 受影响文档扫描
-    changed_files = {k[0] for k in added + removed + sigchanged} | {m[0][0] for m in moved} | {fc[0][0] for fc in fieldchanges}
-    if changed_files:
-        os.chdir(args.root)
-        docs = sorted(glob.glob("AGENTS*.md"))
-        pat = re.compile(r"\[([\w./]+\.go):L(\d+)")
-        print("\n## 受影响文档与待复核引用\n")
-        any_hit = False
-        for md in docs:
-            hits = []
-            for i, line in enumerate(open(md, encoding="utf-8"), 1):
-                for m in pat.finditer(line):
-                    ref, ln = m.group(1), int(m.group(2))
-                    if any(ref == cf or cf.endswith(ref) for cf in changed_files):
-                        hits.append((i, ref, ln))
-            if hits:
-                any_hit = True
-                print(f"### {md}")
-                for i, ref, ln in hits:
-                    print(f"- 第 {i} 行: [{ref}:L{ln}]")
-        if not any_hit:
-            print("（无文档引用受影响的文件）")
-
-    if not (added or removed or moved or sigchanged or fieldchanges or radd or rdel or cadd or cdel):
-        print("\n**无实质变化，文档无需更新。**")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--old', required=True)
+    parser.add_argument('--new', required=True)
+    parser.add_argument('--root', default='.')
+    args = parser.parse_args()
+    old = json.loads(Path(args.old).read_text(encoding='utf-8'))
+    new = json.loads(Path(args.new).read_text(encoding='utf-8'))
+    changes, unknown = compare(old, new)
+    changed = {c['path'] for c in changes}
+    print('# 增量更新报告\n')
+    print(f'变化文件 {len(changed)} 个；无法用哈希比较内容的文件 {len(unknown)} 个。')
+    for change in changes:
+        print('\n## ' + change['path'] + '\n')
+        for reason in change['reasons']:
+            print('- ' + reason)
+    if changes:
+        print('\n## 受影响文档与待复核引用\n')
+        for md, hits in affected_docs(Path(args.root).resolve(), changed).items():
+            print(f'- {md}: ' + '；'.join(f'第 {n} 行引用 {ref}' for n, ref in hits))
+        print('\n同时复核根 AGENTS.md 的模块地图、数据流、命令和统计；新增/删除文件可能尚未被文档引用。')
+    if unknown:
+        print('\n部分文件未记录内容哈希（旧索引或扫描限制），无法排除内容变化；请结合源码/git diff 和 diagnostics 复核。')
+    if old.get('diagnostics') or new.get('diagnostics'):
+        print('\n分析存在 diagnostics，先确认漏扫或解析失败文件的影响。')
+    if not changes:
+        print('\n本次索引未发现变化；结论仅覆盖已扫描文件和已记录信息。')
+    if not old.get('schema_version') or old.get('schema_version') != new.get('schema_version'):
+        print('\n索引版本不同或旧版本未知，请确认扫描范围并重建基线。')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

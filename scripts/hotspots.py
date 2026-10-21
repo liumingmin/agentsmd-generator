@@ -27,8 +27,8 @@ def main():
         if f["line_end"] > args.file:
             big_files.append((f["line_end"], f["path"]))
         for s in f.get("symbols") or []:
-            if s["kind"] in ("func", "method") and s["end_line"] - s["line"] > args.func:
-                big_funcs.append((s["end_line"] - s["line"], f["path"], s["line"], s["name"]))
+            if s.get("line_quality") != "approximate" and s["kind"] in ("func", "method") and s["end_line"] - s["line"] + 1 > args.func:
+                big_funcs.append((s["end_line"] - s["line"] + 1, f["path"], s["line"], s["name"]))
             if s["kind"] == "struct" and len(s.get("fields", [])) > args.struct:
                 big_structs.append((len(s["fields"]), f["path"], s["line"], s["name"]))
 
@@ -47,6 +47,8 @@ def main():
     print(f"\n## 大结构体（>{args.struct} 字段，共 {len(big_structs)} 个）\n")
     for n, p, ln, name in big_structs:
         print(f"- `{name}` [{p}:L{ln}]({p}): {n} 字段")
+
+    print("\n注：行数/字段数是规模信号，不代表性能或语义复杂度；未统计只有候选声明行的函数范围。")
 
     # 根文件用的热点汇总表：函数与结构体混排取 top N
     merged = [(n, f"`{name}` [{p}:L{ln}]({p})", f"{n} 行函数") for n, p, ln, name in big_funcs]

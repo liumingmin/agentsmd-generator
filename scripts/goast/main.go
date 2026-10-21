@@ -1,34 +1,40 @@
 // goast: Go 项目 AST 静态分析器。
 // 遍历项目内所有 .go 文件，输出 JSON 格式的代码索引：
 // 包结构、文件清单、类型/函数/方法的名称、起止行号、导出性、文档注释摘要。
-// 用法: goast -root <项目根目录> [-out <输出json路径>] [-test] [-v]
+// 用法: goast -root <项目根目录> [-out <输出json路径>] [-test]
 package main
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"go/ast"
 	"go/parser"
+	"go/printer"
 	"go/token"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // Symbol 表示一个顶层符号（类型/函数/方法）。
 type Symbol struct {
-	Name     string `json:"name"`              // 符号名，方法为 Recv.Name
-	Kind     string `json:"kind"`              // func | method | struct | interface | type | const | var
-	Exported bool   `json:"exported"`          // 是否导出
-	Line     int    `json:"line"`              // 起始行
-	EndLine  int    `json:"end_line"`          // 结束行
-	Doc      string `json:"doc,omitempty"`     // 文档注释首行
-	Recv     string `json:"recv,omitempty"`    // 方法的接收者类型
-	Params   string  `json:"params,omitempty"`  // 参数摘要
-	Results  string  `json:"results,omitempty"` // 返回值摘要
-	Fields   []Field `json:"fields,omitempty"`  // struct 字段 / interface 方法（仅 kind=struct/interface 时输出）
+	Signature string  `json:"signature,omitempty"`
+	Name      string  `json:"name"`              // 符号名，方法为 Recv.Name
+	Kind      string  `json:"kind"`              // func | method | struct | interface | type | const | var
+	Exported  bool    `json:"exported"`          // 是否导出
+	Line      int     `json:"line"`              // 起始行
+	EndLine   int     `json:"end_line"`          // 结束行
+	Doc       string  `json:"doc,omitempty"`     // 文档注释首行
+	Recv      string  `json:"recv,omitempty"`    // 方法的接收者类型
+	Params    string  `json:"params,omitempty"`  // 参数摘要
+	Results   string  `json:"results,omitempty"` // 返回值摘要
+	Fields    []Field `json:"fields,omitempty"`  // struct 字段 / interface 方法（仅 kind=struct/interface 时输出）
 }
 
 // Field 表示结构体字段或接口方法签名。
@@ -43,12 +49,15 @@ type Field struct {
 
 // FileInfo 表示一个 Go 文件。
 type FileInfo struct {
-	Path    string   `json:"path"`           // 相对项目根的路径（正斜杠）
-	Package string   `json:"package"`        // 包名
-	LineEnd int      `json:"line_end"`       // 文件总行数
-	Imports []string `json:"imports"`        // 导入路径
-	Symbols []Symbol `json:"symbols"`        // 顶层符号
-	IsTest  bool     `json:"is_test"`        // 是否测试文件
+	ContentHash      string   `json:"content_hash"`
+	Generated        bool     `json:"generated,omitempty"`
+	BuildConstraints []string `json:"build_constraints,omitempty"`
+	Path             string   `json:"path"`     // 相对项目根的路径（正斜杠）
+	Package          string   `json:"package"`  // 包名
+	LineEnd          int      `json:"line_end"` // 文件总行数
+	Imports          []string `json:"imports"`  // 导入路径
+	Symbols          []Symbol `json:"symbols"`  // 顶层符号
+	IsTest           bool     `json:"is_test"`  // 是否测试文件
 }
 
 // PkgInfo 表示一个包（目录）。
@@ -60,28 +69,41 @@ type PkgInfo struct {
 
 // Route 表示一个 HTTP 路由注册（如 admin.POST("/path", Handler)）。
 type Route struct {
-	Method  string `json:"method"`  // HTTP 方法（POST/GET/...）
-	Path    string `json:"path"`    // 路由路径
-	Handler string `json:"handler"` // 处理函数（尽量带包名）
-	File    string `json:"file"`    // 所在文件
-	Line    int    `json:"line"`    // 所在行
+	Receiver   string   `json:"receiver"`
+	Handlers   []string `json:"handlers"`
+	Confidence string   `json:"confidence"`
+	Method     string   `json:"method"`  // HTTP 方法（POST/GET/...）
+	Path       string   `json:"path"`    // 路由路径
+	Handler    string   `json:"handler"` // 处理函数（尽量带包名）
+	File       string   `json:"file"`    // 所在文件
+	Line       int      `json:"line"`    // 所在行
 }
 
 // CronJob 表示一个 cron 表达式（来自字符串字面量或注释）。
 type CronJob struct {
-	Expr string `json:"expr"` // cron 表达式
-	File string `json:"file"`
-	Line int    `json:"line"`
+	Source     string `json:"source"`
+	Confidence string `json:"confidence"`
+	Expr       string `json:"expr"` // cron 表达式
+	File       string `json:"file"`
+	Line       int    `json:"line"`
+}
+
+// Diagnostic records a file excluded because it could not be parsed.
+type Diagnostic struct {
+	Path   string `json:"path"`
+	Reason string `json:"reason"`
 }
 
 // Report 是分析结果。
 type Report struct {
-	Root     string     `json:"root"`
-	Packages []PkgInfo  `json:"packages"`
-	Files    []FileInfo `json:"files"`
-	Routes   []Route    `json:"routes,omitempty"`
-	Crons    []CronJob  `json:"crons,omitempty"`
-	Stats    Stats      `json:"stats"`
+	SchemaVersion int          `json:"schema_version"`
+	Diagnostics   []Diagnostic `json:"diagnostics"`
+	Root          string       `json:"root"`
+	Packages      []PkgInfo    `json:"packages"`
+	Files         []FileInfo   `json:"files"`
+	Routes        []Route      `json:"routes,omitempty"`
+	Crons         []CronJob    `json:"crons,omitempty"`
+	Stats         Stats        `json:"stats"`
 }
 
 // Stats 统计信息。
@@ -108,7 +130,7 @@ func main() {
 	}
 
 	fset := token.NewFileSet()
-	report := &Report{Root: filepath.ToSlash(absRoot)}
+	report := &Report{SchemaVersion: 2, Root: filepath.ToSlash(absRoot), Files: []FileInfo{}, Packages: []PkgInfo{}, Diagnostics: []Diagnostic{}}
 	pkgMap := map[string]*PkgInfo{}
 
 	err = filepath.Walk(absRoot, func(path string, info os.FileInfo, err error) error {
@@ -116,15 +138,15 @@ func main() {
 			return err
 		}
 		if info.IsDir() {
-			if info.Name() != "." && skipDirs[info.Name()] {
+			if path != absRoot && skipDirs[info.Name()] {
 				return filepath.SkipDir
 			}
-			if strings.HasPrefix(info.Name(), ".") && info.Name() != "." {
+			if path != absRoot && strings.HasPrefix(info.Name(), ".") {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		if !strings.HasSuffix(info.Name(), ".go") {
+		if info.Mode()&os.ModeSymlink != 0 || !strings.HasSuffix(info.Name(), ".go") {
 			return nil
 		}
 		isTest := strings.HasSuffix(info.Name(), "_test.go")
@@ -135,20 +157,34 @@ func main() {
 		rel, _ := filepath.Rel(absRoot, path)
 		rel = filepath.ToSlash(rel)
 
-		f, err := parser.ParseFile(fset, path, nil, parser.ParseComments)
+		source, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		f, err := parser.ParseFile(fset, path, source, parser.ParseComments|parser.SkipObjectResolution)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "warn: parse %s: %v\n", rel, err)
+			report.Diagnostics = append(report.Diagnostics, Diagnostic{Path: rel, Reason: err.Error()})
 			return nil
 		}
 
 		fi := FileInfo{
-			Path:    rel,
-			Package: f.Name.Name,
-			LineEnd: fset.Position(f.End()).Line,
-			IsTest:  isTest,
+			Path:        rel,
+			Package:     f.Name.Name,
+			LineEnd:     physicalLines(source),
+			ContentHash: fmt.Sprintf("%x", sha256.Sum256(source)),
+			Generated:   ast.IsGenerated(f),
+			IsTest:      isTest,
+		}
+		for _, group := range f.Comments {
+			for _, comment := range group.List {
+				if strings.HasPrefix(comment.Text, "//go:build ") || strings.HasPrefix(comment.Text, "// +build ") {
+					fi.BuildConstraints = append(fi.BuildConstraints, comment.Text)
+				}
+			}
 		}
 		for _, imp := range f.Imports {
-			fi.Imports = append(fi.Imports, strings.Trim(imp.Path.Value, `"`))
+			fi.Imports = append(fi.Imports, unquote(imp.Path.Value))
 		}
 
 		// 提取路由注册（xxx.POST("/path", handler)）与 cron 表达式
@@ -160,13 +196,13 @@ func main() {
 				}
 			case *ast.BasicLit:
 				if node.Kind == token.STRING {
-					if expr, ok := parseCron(strings.Trim(node.Value, `"`+"`")); ok {
-						report.Crons = append(report.Crons, CronJob{Expr: expr, File: rel, Line: fset.Position(node.Pos()).Line})
+					if expr, ok := parseCron(unquote(node.Value)); ok {
+						report.Crons = append(report.Crons, CronJob{Expr: expr, File: rel, Line: fset.Position(node.Pos()).Line, Source: "string", Confidence: "candidate"})
 					}
 				}
 			case *ast.Comment:
 				if expr, ok := parseCron(node.Text); ok {
-					report.Crons = append(report.Crons, CronJob{Expr: expr, File: rel, Line: fset.Position(node.Pos()).Line})
+					report.Crons = append(report.Crons, CronJob{Expr: expr, File: rel, Line: fset.Position(node.Pos()).Line, Source: "comment", Confidence: "candidate"})
 				}
 			}
 			return true
@@ -176,14 +212,15 @@ func main() {
 			switch d := decl.(type) {
 			case *ast.FuncDecl:
 				s := Symbol{
-					Kind:     "func",
-					Name:     d.Name.Name,
-					Exported: ast.IsExported(d.Name.Name),
-					Line:     fset.Position(d.Pos()).Line,
-					EndLine:  fset.Position(d.End()).Line,
-					Doc:      firstLine(d.Doc),
-					Params:   fieldListSummary(d.Type.Params),
-					Results:  fieldListSummary(d.Type.Results),
+					Kind:      "func",
+					Signature: exprString(d.Type),
+					Name:      d.Name.Name,
+					Exported:  ast.IsExported(d.Name.Name),
+					Line:      fset.Position(d.Pos()).Line,
+					EndLine:   fset.Position(d.End()).Line,
+					Doc:       firstLine(d.Doc),
+					Params:    fieldListSummary(d.Type.Params),
+					Results:   fieldListSummary(d.Type.Results),
 				}
 				if d.Recv != nil && len(d.Recv.List) > 0 {
 					s.Kind = "method"
@@ -194,26 +231,27 @@ func main() {
 			case *ast.GenDecl:
 				for _, spec := range d.Specs {
 					switch sp := spec.(type) {
-				case *ast.TypeSpec:
-					kind := "type"
-					var fields []Field
-					switch t := sp.Type.(type) {
-					case *ast.StructType:
-						kind = "struct"
-						fields = structFields(fset, t)
-					case *ast.InterfaceType:
-						kind = "interface"
-						fields = interfaceMethods(fset, t)
-					}
-					fi.Symbols = append(fi.Symbols, Symbol{
-						Kind:     kind,
-						Name:     sp.Name.Name,
-						Exported: ast.IsExported(sp.Name.Name),
-						Line:     fset.Position(sp.Pos()).Line,
-						EndLine:  fset.Position(sp.End()).Line,
-						Doc:      firstLine(d.Doc),
-						Fields:   fields,
-					})
+					case *ast.TypeSpec:
+						kind := "type"
+						var fields []Field
+						switch t := sp.Type.(type) {
+						case *ast.StructType:
+							kind = "struct"
+							fields = structFields(fset, t)
+						case *ast.InterfaceType:
+							kind = "interface"
+							fields = interfaceMethods(fset, t)
+						}
+						fi.Symbols = append(fi.Symbols, Symbol{
+							Kind:      kind,
+							Name:      sp.Name.Name,
+							Exported:  ast.IsExported(sp.Name.Name),
+							Line:      fset.Position(sp.Pos()).Line,
+							EndLine:   fset.Position(sp.End()).Line,
+							Doc:       specDoc(sp.Doc, d.Doc),
+							Signature: nodeString(sp),
+							Fields:    fields,
+						})
 					case *ast.ValueSpec:
 						kind := "var"
 						if d.Tok == token.CONST {
@@ -226,7 +264,7 @@ func main() {
 								Exported: ast.IsExported(name.Name),
 								Line:     fset.Position(sp.Pos()).Line,
 								EndLine:  fset.Position(sp.End()).Line,
-								Doc:      firstLine(d.Doc),
+								Doc:      specDoc(sp.Doc, d.Doc),
 							})
 						}
 					}
@@ -258,7 +296,12 @@ func main() {
 		sort.Strings(p.Files)
 		report.Packages = append(report.Packages, *p)
 	}
-	sort.Slice(report.Packages, func(i, j int) bool { return report.Packages[i].Dir < report.Packages[j].Dir })
+	sort.Slice(report.Packages, func(i, j int) bool {
+		if report.Packages[i].Dir == report.Packages[j].Dir {
+			return report.Packages[i].Package < report.Packages[j].Package
+		}
+		return report.Packages[i].Dir < report.Packages[j].Dir
+	})
 	sort.Slice(report.Files, func(i, j int) bool { return report.Files[i].Path < report.Files[j].Path })
 	report.Stats.FileCount = len(report.Files)
 	report.Stats.PackageCount = len(report.Packages)
@@ -290,8 +333,8 @@ func firstLine(cg *ast.CommentGroup) string {
 		text = text[:i]
 	}
 	const maxLen = 120
-	if len(text) > maxLen {
-		text = text[:maxLen] + "..."
+	if len([]rune(text)) > maxLen {
+		text = string([]rune(text)[:maxLen]) + "..."
 	}
 	return text
 }
@@ -315,33 +358,47 @@ func extractRoute(fset *token.FileSet, call *ast.CallExpr, file string) (Route, 
 	if !ok || pathLit.Kind != token.STRING {
 		return Route{}, false
 	}
-	path := strings.Trim(pathLit.Value, `"`+"`")
+	path := unquote(pathLit.Value)
 	if !strings.HasPrefix(path, "/") {
 		return Route{}, false
 	}
+	handlers := []string{}
+	for _, arg := range call.Args[1:] {
+		handlers = append(handlers, exprString(arg))
+	}
 	return Route{
-		Method:  strings.ToUpper(sel.Sel.Name),
-		Path:    path,
-		Handler: exprString(call.Args[1]),
-		File:    file,
-		Line:    fset.Position(call.Pos()).Line,
+		Receiver:   exprString(sel.X),
+		Handlers:   handlers,
+		Confidence: "candidate",
+		Method:     strings.ToUpper(sel.Sel.Name),
+		Path:       path,
+		Handler:    handlers[len(handlers)-1],
+		File:       file,
+		Line:       fset.Position(call.Pos()).Line,
 	}, true
 }
 
-// parseCron 判断文本是否以 cron 表达式（5 段或带 @ 前缀）开头。
+// parseCron identifies whole candidate expressions; it does not validate registration or field ranges.
 func parseCron(text string) (string, bool) {
 	text = strings.TrimSpace(strings.TrimLeft(text, "/# "))
 	fields := strings.Fields(text)
 	if len(fields) == 0 {
 		return "", false
 	}
-	if strings.HasPrefix(fields[0], "@") { // @daily @hourly 等
-		return fields[0], true
+	if fields[0] == "@every" && len(fields) == 2 {
+		if duration, err := time.ParseDuration(fields[1]); err == nil && duration > 0 {
+			return strings.Join(fields, " "), true
+		}
 	}
-	if len(fields) < 5 {
+	for _, descriptor := range []string{"@yearly", "@annually", "@monthly", "@weekly", "@daily", "@midnight", "@hourly", "@reboot"} {
+		if fields[0] == descriptor && len(fields) == 1 {
+			return fields[0], true
+		}
+	}
+	if len(fields) < 5 || len(fields) > 7 {
 		return "", false
 	}
-	cand := fields[:5]
+	cand := fields // Preserve seconds/year fields; this is a candidate, not validation.
 	for _, f := range cand {
 		if !cronFieldOK(f) {
 			return "", false
@@ -441,7 +498,8 @@ func interfaceMethods(fset *token.FileSet, it *ast.InterfaceType) []Field {
 	return out
 }
 
-func recvTypeName(expr ast.Expr) string {	switch t := expr.(type) {
+func recvTypeName(expr ast.Expr) string {
+	switch t := expr.(type) {
 	case *ast.StarExpr:
 		return recvTypeName(t.X)
 	case *ast.Ident:
@@ -475,31 +533,41 @@ func fieldListSummary(fl *ast.FieldList) string {
 }
 
 func exprString(expr ast.Expr) string {
-	switch t := expr.(type) {
-	case *ast.Ident:
-		return t.Name
-	case *ast.StarExpr:
-		return "*" + exprString(t.X)
-	case *ast.SelectorExpr:
-		return exprString(t.X) + "." + t.Sel.Name
-	case *ast.ArrayType:
-		return "[]" + exprString(t.Elt)
-	case *ast.MapType:
-		return "map[" + exprString(t.Key) + "]" + exprString(t.Value)
-	case *ast.InterfaceType:
-		return "interface{}"
-	case *ast.FuncType:
-		return "func"
-	case *ast.ChanType:
-		return "chan " + exprString(t.Value)
-	case *ast.Ellipsis:
-		return "..." + exprString(t.Elt)
-	case *ast.IndexExpr:
-		return exprString(t.X)
-	case *ast.IndexListExpr:
-		return exprString(t.X)
+	return nodeString(expr)
+}
+
+func nodeString(node ast.Node) string {
+	var out bytes.Buffer
+	if err := printer.Fprint(&out, token.NewFileSet(), node); err != nil {
+		return "?"
 	}
-	return "?"
+	return out.String()
+}
+
+func specDoc(primary, fallback *ast.CommentGroup) string {
+	if primary != nil {
+		return firstLine(primary)
+	}
+	return firstLine(fallback)
+}
+
+func unquote(value string) string {
+	decoded, err := strconv.Unquote(value)
+	if err != nil {
+		return value
+	}
+	return decoded
+}
+
+func physicalLines(source []byte) int {
+	if len(source) == 0 {
+		return 0
+	}
+	count := bytes.Count(source, []byte("\n"))
+	if source[len(source)-1] != '\n' {
+		count++
+	}
+	return count
 }
 
 func fatal(err error) {

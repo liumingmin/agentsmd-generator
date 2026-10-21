@@ -1,151 +1,116 @@
 ---
 name: agentsmd-generator
-description: 分析项目代码与文档，生成项目级 AGENTS.md 说明文件，并为每个模块生成独立的模块说明文件（AGENTS.模块名.md），模块说明列出详细功能点及代码文件行号。内置 Golang AST 分析程序（scripts/goast）精确定位 Go 代码的包/文件/类型/函数/方法/结构体字段行号，另附多语言轻量索引脚本（scripts/codeindex.py，支持 TS/JS/Python/Java/Rust/C++/SQL/proto/shell）。触发词：生成 AGENTS.md / 生成 agents.md / 生成项目说明文件 / 分析项目生成模块文档 / 给项目写导航文档 / 生成模块说明并带行号 / 项目代码导览文档 / 更新 AGENTS.md。This skill should be used when the user wants to generate or update an AGENTS.md project guide with per-module docs containing feature lists and code line numbers.
+description: 分析仓库源码、测试和配置，生成或更新带源码行号的 AGENTS.md 项目导览及 AGENTS.模块名.md 模块说明。用于项目说明、模块功能梳理、代码导航和维护已有导览文档。
 ---
 
-# AGENTS.md 生成器（项目导览文档）
+# AGENTS.md 项目导览生成器
 
-## Overview
+生成能帮助维护者理解项目、定位实现和验证修改的说明文件。根 `AGENTS.md` 提供项目地图，各 `AGENTS.<模块名>.md` 解释模块行为、接口与协作；细节必须能回溯到当前源码。
 
-为项目生成一套导览文档：根目录 `AGENTS.md` 作为总入口，概述项目定位、架构与构建方式，并链接到每个模块的说明文件 `AGENTS.<模块名>.md`；每个模块说明文件列出详细功能点，并标注关键符号所在代码文件与行号。
+## 1. 确认范围并收集证据
 
-**语言策略**：Go 代码用 `scripts/goast`（完整 AST，行号精确，含结构体字段/接口方法/签名/tag）；其他语言用 `scripts/codeindex.py`（正则轻量索引，行号仅供参考，引用前必须人工核实）；不支持的语言只作定性描述。
+读取目标仓库现有 `AGENTS.md` 和目录级指令。更新已有文件时保留人工维护的指令、约定与其他无关内容；已有标记区则只更新相应区块。记录分析的项目根、排除范围、语言和当前提交（如可用），不要把本技能自身当作目标项目。
 
-## 执行逻辑（必须按顺序执行）
-
-### Step 1 — 静态分析
-
-**Go 项目 / 含 Go 的混合项目**（默认排除 vendor/.git/node_modules 等目录）：
+所有分析使用**同一个项目根**，使 JSON 文件路径和文档引用保持一致。脚本仅用标准库；Python 需要 3.10+，Go 版本要求见 `scripts/goast/go.mod`（当前 1.24.3+）。将 `<skill_dir>` / `<项目根>` 替换成实际绝对路径。
 
 ```bash
-# Windows
-<skill_dir>/scripts/goast/goast.exe -root <项目根> -out <项目根>/.agentsmd/ast.json
-# 源码方式（无 exe 或需跨平台时）
-cd <skill_dir>/scripts/goast && go run . -root <项目根> -out <项目根>/.agentsmd/ast.json
+# 所有项目：依赖、配置、CI、部署、迁移、测试等资产清单与内容哈希
+python3 <skill_dir>/scripts/projectcontext.py --root <项目根> --out <项目根>/.agentsmd/context.json
+
+# 含 Go：构建一次后使用；Windows 将二进制名改为 goast.exe
+(cd <skill_dir>/scripts/goast && go build -o <skill_dir>/scripts/goast/goast .)
+<skill_dir>/scripts/goast/goast -root <项目根> -out <项目根>/.agentsmd/ast.json
+
+# 含其他支持语言：Python AST + 其余语言轻量索引；可选 --ext .ts,.py
+python3 <skill_dir>/scripts/codeindex.py --root <项目根> --out <项目根>/.agentsmd/index.json
 ```
 
-若 `goast.exe` 不存在或平台不匹配，先 `go build -o goast.exe .`（需要 Go 1.21+）。纯 Go 标准库实现，无第三方依赖。
+先检查各 JSON 的 `diagnostics` 和扫描范围。解析失败、被跳过或不支持的文件需要手动检查，不能作为“项目没有该功能”的依据。保持 `.agentsmd/` 作为更新基线，用户要求清理时再删除。
 
-**非 Go 语言部分**（同一项目内的前端/脚本/SQL 等，或纯非 Go 项目）：
+**索引能力与边界**：
+
+- Go 使用语法树，包含类型、字段/tag、接口方法、泛型/函数类型签名、生成代码标记和构建条件；不执行类型检查，不按构建标签筛选当前平台文件。
+- Python 使用标准库 AST，包含类、方法、函数、docstring、参数/返回类型、imports 和精确声明范围；导出性只是下划线命名惯例。
+- TS/JS/Java/Kotlin/Rust/C/C++/SQL/proto/shell 使用正则，只给声明行；`exported: null` 表示未知，不能据此列为公共 API。复杂嵌套、多行声明和动态导入可能遗漏。所有重要引用均打开源码核实。
+- `routes` / `crons` 是 **候选线索**：路由接收者不一定为 HTTP 框架，路径可能缺少分组前缀，handlers 可能含中间件；cron 字符串或注释不代表已注册、启用或使用指定时区。必须阅读注册调用和配置后再写成接口/任务。
+- `context.json` 的分类与入口文件名也只是候选。`files[].facts` 提供可解析的 `go.mod`、`package.json` 和构建目标证据，其他 manifest 需要自行阅读。JSON 事实用 `json_pointer` 定位，不伪造行号。
+
+## 2. 阅读实现，建立模块地图
+
+结合目录、包、工作区 manifest 与实际调用边界划分业务/技术模块；小包可合并，但每个源目录都应有归属。独立应用、前后端、共享库、迁移和运维资产分别说明其作用。不要默认“顶层目录等于业务模块”。
+
+用 `context.json` 的 `categories` 找到 README/设计文档、嵌套 manifest、入口、配置、测试、CI、Dockerfile、迁移与 proto。大项目先完整盘点，再围绕每个模块的公共入口和核心流程深入阅读；明确记录抽样范围和遗漏，避免宣称完整覆盖。
+
+每个模块至少追踪一条真实流程：**入口/调用方 → 参数校验与分支 → 核心处理 → 存储/外部调用 → 结果或错误**。有多种主要能力时分别追踪。查找实际调用位置确认反向协作；只有 imports 时称“导入依赖”，不要称为函数调用关系。
 
 ```bash
-python <skill_dir>/scripts/codeindex.py --root <项目根或子目录> --out <项目根>/.agentsmd/index.json
-# 限定语言：--ext .ts,.py
+# 可选辅助报告；纯非 Go 项目的 --ast 改为 .agentsmd/index.json
+python3 <skill_dir>/scripts/hotspots.py --ast <项目根>/.agentsmd/ast.json
+# Go 内部包导入关系；支持嵌套 go.mod，不能代替实际调用追踪
+python3 <skill_dir>/scripts/callgraph.py --ast <项目根>/.agentsmd/ast.json --root <项目根>
 ```
 
-goast 输出 JSON：`packages`（目录→包→文件）、`files`（每文件 imports、symbols）、`routes`（HTTP 路由注册：方法/路径/处理函数/行号）、`crons`（cron 表达式及位置）。symbol 带 `kind`（func/method/struct/interface/type/const/var）、`line`/`end_line`、`doc`、`params`/`results`，struct/interface 额外带 `fields`（字段名/类型/行号/tag/是否嵌入）。codeindex 输出结构对齐但字段精简。**Go 符号行号只能取自 goast 输出；其他语言行号引用前必须打开文件核实。**
+事实来源以当前源码/测试、manifest/配置为主，README/注释用于理解意图。遇到冲突，指出文档与实现的具体差异；无法静态确认的行为列为“待核实”。依赖存在不等于已接入或启用；发现测试不等于测试通过或覆盖了所有分支；规模热点不等于性能问题。
 
-辅助脚本（Step 2/5/6 中调用）：
+## 3. 编写模块文档
+
+先读 [references/module-doc-template.md](references/module-doc-template.md)，再按实际模块复杂度编写。避免逐函数复制索引；重点解释使用者能做什么、由哪些代码实现、受什么条件限制。
+
+每条主要功能说明触发方式/输入、关键处理、输出/副作用、重要失败或边界条件，并引用相应实现。跨模块流程分别引用调用端与被调端，避免仅凭单个函数名推断数据流。公共 API 记录有意义的参数、返回值和错误语义；大型类型只解释影响行为的字段。
+
+模块必须交代职责与目录、功能点清单、入口与调用流程、依赖与协作、测试与验证。根据实际实现补充配置默认值/优先级、外部资源、数据模型/状态变化、事务/幂等、并发/生命周期和可观测性。没有证据的主题直接说明尚未确认或不适用，不用空表或通用建议填充。
+
+## 4. 编写根 AGENTS.md
+
+根文件覆盖以下项目事实，并链接到详细模块文档：
+
+- 项目定位与适用范围；分析版本、语言及扫描限制。
+- **模块地图**：模块文档链接、实际目录、职责、关键入口；指出共享库、部署与测试资产的归属。
+- **架构与数据流**：描述主要运行流程及输入、模块协作、外部资源和最终输出；标出动态行为/待核实环节。
+- **构建/运行/测试**：每条命令注明工作目录、前置工具/服务、来源文件、必要配置、结果/产物；区分“由配置确认的命令”和“本次执行通过的命令”。不根据包管理器或目录名编造命令，也不为生成文档启动服务或执行部署。
+- 配置与外部依赖：版本取自 manifest（声明范围与锁定版本分开），说明入口配置与优先级，只记录变量名和必要的非敏感默认值。
+- 项目约定与修改导航：依据源码或现有维护指令，说明常见改动应涉及的文件及对应测试。错误处理、日志与并发约定必须有实现证据。
+- 测试现状、待核实项与主要维护风险；已有 README/设计/部署文档链接。历史信息只在解释当前实现时纳入。
+
+统计按索引分别列出，区分“源码索引文件数”和“资产清单文件数”、是否含测试、Go 包和其他语言目录分组，避免无依据相加。需要自动校验统计时，在对应表格附近使用如下标记（替换为真实值）：
+
+```html
+<!-- agentsmd:stats {"source":".agentsmd/ast.json","file_count":12,"package_count":3,"symbol_count":48} -->
+```
+
+混合项目为 `ast.json` 与 `index.json` 分别添加标记。校验器检查该标记，仍需人工确认可见表格与标记一致。
+
+## 5. 校验与交付
 
 ```bash
-# 复杂度信号（大文件/大函数/大结构体 + 根文件热点表）
-python <skill_dir>/scripts/hotspots.py --ast <项目根>/.agentsmd/ast.json
-# 模块依赖图初稿（import 级聚合 + 被依赖排行）
-python <skill_dir>/scripts/callgraph.py --ast <项目根>/.agentsmd/ast.json [--module <go module前缀>]
-# 交付前自动校验（行号引用/字段引用/死链/统计一致性）
-python <skill_dir>/scripts/verify.py --root <项目根> [--strict]
+# 自动读取存在的 ast.json 和 index.json；也可重复 --ast 显式指定
+python3 <skill_dir>/scripts/verify.py --root <项目根>
+# 需要警告也判失败时使用 --strict
 ```
 
-### Step 2 — 补充非代码信息
+校验器递归检查 `AGENTS*.md` 的文件/行号范围、链接目标一致性、索引内容哈希及显式统计标记；不会判断功能描述语义，也不验证任意 Markdown 章节锚点。源码语句和配置行也是合法证据，不必强行引用符号起始行。零错误通过后逐条复核警告，并人工确认：
 
-静态分析只覆盖符号，还需读取：
+- 模块地图涵盖实际源目录；主要功能没有被测试辅助函数或索引条目淹没。
+- 每条流程的输入、处理、输出和关键失败条件有证据；跨模块调用核对了双方。
+- 路由前缀/中间件、cron 注册/时区、配置默认值和命令工作目录已核实或明确标注未知。
+- “未发现测试”“未运行”“执行失败”和“执行通过”没有混用；未测量覆盖率时不作覆盖率结论。
+- 现有人工维护指令已保留；无未替换占位符；源码引用与当前文件一致。
 
-1. 依赖清单：`go.mod` / `package.json` / `requirements.txt` / `Cargo.toml` / `pom.xml`（模块名、版本、关键依赖）
-2. 现有 `README.md` 与各级 `*.md`（提炼项目定位、用法、部署说明）
-3. 入口文件（`main.go` / `cmd/` / `index.ts` / `manage.py` 等）与配置文件，归纳启动方式与外部依赖（DB、MQ、第三方服务）
-4. SQL 迁移、proto、Makefile/Dockerfile/CI 配置等非代码资产，在相关模块备注中提及
-5. **复杂度信号**：运行 `scripts/hotspots.py` 自动提取大文件/大函数/超大结构体，在模块文档"备注"中提示后续维护者；Top N 热点表直接用于根文件
-6. **接口与调度清单**：HTTP 路由与 cron 任务直接取自 ast.json 的 `routes`/`crons`，写入相关模块文档，不再人工翻入口文件
-7. **约定归纳**：抽样阅读 2-3 个核心文件，归纳错误处理、日志、命名、目录分层等风格约定（写进根 AGENTS.md）
-8. **版本历史**：若存在 CHANGELOG.md 或 git 可用，提取近 3-5 条重大变更写入根文件（可选，能显著提升导览价值）
+交付根文档和模块文档路径，简述分析范围、校验结果及仍需运行环境确认的事项。
 
-### Step 3 — 划分模块
+## 增量更新
 
-以 `packages[].dir`（Go）或顶层目录（其他语言）为天然模块边界；目录过多时按业务域归并。每个模块对应一个说明文件。文件极少的包可合并到最近的业务模块并在文中说明。混合语言项目按"语言+业务域"双维度划分（如 `前端-web` / `后端-api` / `脚本-etl`）。
-
-### Step 4 — 生成模块说明文件
-
-按 `references/module-doc-template.md` 的模板，为每个模块写 `AGENTS.<模块名>.md`：
-
-- **功能点清单**：按业务视角归纳功能点（不是逐函数罗列），每条功能点标注关键符号和 `[文件:L<起>-L<止>]` 行号区间
-- **核心类型 / 对外接口**表格：类型、签名、说明、行号；Go 结构体可用 `fields` 摘关键字段及行号
-- **依赖与协作**：从 imports 与调用关系归纳
-- **备注**：大文件/大函数提示、deprecated 符号、TODO、测试覆盖入口
-- 行号一律写 `file.go:L<n>` 形式；功能描述要结合 `doc` 注释与代码语义，不要照抄注释
-- 非 Go 符号行号注明"约"（如 `file.ts:L120（约）`）或核实后再写
-
-### Step 5 — 生成根 AGENTS.md
-
-根文件包含：
-
-1. **项目一句话定位** + 关键背景
-2. **模块地图**：表格列出每个模块 → 链接到 `./AGENTS.<模块名>.md`，附一句话职责
-3. **架构与数据流**：简述入口 → 各模块协作关系（可配 ASCII 图）
-4. **构建/运行/测试**：从 README、Makefile、依赖清单归纳
-5. **代码统计**：文件数/包数/符号数（取分析输出的 stats，多语言分行列出）
-6. **约定**：包管理、错误处理、日志等项目级约定
-7. **版本历史**（如有 CHANGELOG/git）：近几条重大变更
-8. **其他文档索引**：项目已有的 README/设计文档/问题记录链接
-
-### Step 6 — 校验
-
-先跑自动校验，再人工复核清单：
+对已有的 `ast.json`、`index.json`、`context.json` 分别保留 `.old.json` 备份，再按相同根目录、过滤参数和工具版本重跑。缺少旧基线时执行完整分析。
 
 ```bash
-python <skill_dir>/scripts/verify.py --root <项目根>   # 行号引用/字段引用/死链/统计一致性
+# 为每一对存在的新旧快照执行；context.json 同样使用此脚本
+python3 <skill_dir>/scripts/diff.py --old <旧快照.json> --new <新快照.json> --root <项目根>
 ```
 
-verify.py 必须零错误通过（警告需逐条确认可接受）；然后人工确认：
+报告覆盖文件新增/删除、内容哈希、符号/字段/签名、imports、路由/cron 候选变化，并定位根目录或子目录文档中的引用。函数体改变但签名/行数未变也需要复核；配置、CI、manifest 和 README 变化以 context 快照补充。
 
-- [ ] 每个模块文档都有：一句话职责、功能点清单（含行号）、依赖协作，三项缺一不可
-- [ ] 功能点是业务视角归纳，不是函数清单复制
-- [ ] 清理中间产物：询问用户是否保留 `.agentsmd/`（默认保留，便于增量更新）
+按报告更新相关功能描述、行号、模块地图与统计，并重新执行校验。新增文件可能尚无引用，需检查模块归属；导入关系或公共接口改变时再检查依赖模块。没有索引变化只表示已扫描信息相同；旧索引无哈希、有 diagnostics、过滤范围/工具版本改变时不能据此断言无需更新。成功后再移除旧备份，保留当前基线。
 
-## 增量更新（触发词"更新 AGENTS.md"走此路径）
+## 写入边界
 
-diff 驱动，四步完成：
-
-```bash
-# 1. 备份旧分析
-cp <项目根>/.agentsmd/ast.json <项目根>/.agentsmd/ast.old.json
-# 2. 重跑 goast（代码已变动）
-<skill_dir>/scripts/goast/goast.exe -root <项目根> -out <项目根>/.agentsmd/ast.json
-# 3. 生成增量报告
-python <skill_dir>/scripts/diff.py --old <项目根>/.agentsmd/ast.old.json --new <项目根>/.agentsmd/ast.json --root <项目根>
-# 4. 按报告更新文档后校验
-python <skill_dir>/scripts/verify.py --root <项目根>
-```
-
-diff.py 报告包含：符号新增/删除/行号偏移/签名变化、结构体字段变化、路由与 cron 变化，以及**受影响文档清单**——自动扫描 AGENTS*.md，列出引用了变化文件的具体行号位置（"第 N 行: [file.go:L<m>]"），按清单逐处复核更新即可，无需全文重读。
-
-- 报告为"无实质变化"时直接结束，不动文档
-- 行号偏移条目：更新文档中对应引用；签名变化条目：评估功能描述是否改写
-- 更新完成后删除 `ast.old.json`，并更新根文件统计
-
-## 边界
-
-- Go 符号行号精确；其他语言行号为正则说明性结果，交付前必须核实
-- 不修改任何项目源码，只新增/更新 `AGENTS*.md` 文档
-
-## Resources
-
-### scripts/goast/
-Go AST 静态分析器（`main.go` + 预编译 `goast.exe`）。单文件标准库实现，可 `go build` 跨平台重编译。输出含结构体字段/接口方法明细、HTTP 路由注册、cron 表达式。用法见 Step 1。
-
-### scripts/codeindex.py
-多语言轻量索引器（纯标准库 Python 3）。支持 TS/JS/Python/Java/Kotlin/Rust/C/C++/SQL/proto/shell，输出与 goast 对齐的 JSON。正则实现，行号 best-effort。
-
-### scripts/hotspots.py
-复杂度信号提取：大文件/大函数/大结构体清单 + 根文件热点表（阈值可调）。
-
-### scripts/callgraph.py
-模块依赖图：聚合 imports 生成 ASCII 依赖边与"被依赖最多"排行。
-
-### scripts/verify.py
-交付前自动校验：行号引用命中、字段级引用、死链、统计一致性，零错误才能交付。
-
-### scripts/diff.py
-增量更新：对比新旧 ast.json，输出符号/字段/路由/cron 变化与受影响文档的引用位置清单。
-
-### references/module-doc-template.md
-模块说明文件模板与编写规则。生成模块文档前必须读取。
+在目标仓库只新增/更新授权的 `AGENTS*.md` 和 `.agentsmd/` 分析产物。保留原项目源码与人工维护指令；不自动提交、部署或修改项目配置。

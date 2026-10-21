@@ -1,158 +1,201 @@
 #!/usr/bin/env python3
-"""verify: AGENTS.md 文档质量自动校验。
+"""Validate guide references, local links, index freshness and scoped statistics.
 
-校验项：
-1. 行号引用 —— 文档中 [file.go:L<n>] / [file.go:L<n>-L<m>] 必须命中 goast
-   输出中的符号或字段起始行；.sh/.sql 等非 Go 文件只检查文件存在。
-2. 字段引用 —— 文中 `Type.Field`(L<n>) 形式的字段级引用，校验字段行号。
-3. 死链 —— markdown 相对链接指向的文件必须存在。
-4. 统计一致性 —— 根 AGENTS.md 中出现的"文件 N"/"符号 N"等数字与 ast.json
-   stats 对比（宽松匹配，仅提示）。
-
-用法:
-    python verify.py --root <项目根> [--ast .agentsmd/ast.json] [--strict]
-退出码: 0 全部通过 / 1 存在问题。
+Default inputs: .agentsmd/ast.json and .agentsmd/index.json (whichever exist).
+Repeat --ast to select inputs explicitly. Labels use project-root paths, e.g.
+[src/foo.go:L10-L20](src/foo.go#L10-L20). Link targets are relative to the doc.
+Physical source ranges (including statements/config lines) are valid evidence;
+matching a symbol start alone cannot establish correctness of a written claim.
 """
 import argparse
-import glob
+import hashlib
 import json
 import os
 import re
-import sys
+from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
-REF_PAT = re.compile(r"\[([\w./\\]+\.(?:go|sh|sql|py|ts|js|java|rs|proto)):L(\d+)(?:-L(\d+))?\]")
-LINK_PAT = re.compile(r"\]\(([^)\s#]+)\)")
-FIELD_PAT = re.compile(r"`(\w+)\.(\w+)`\(L(\d+)\)")
-GO_EXT = {".go"}
-
-
-def build_index(ast):
-    """path -> {'symbol_lines': set, 'fields': {(Type, Field): line}}"""
-    idx = {}
-    for f in ast["files"]:
-        entry = idx.setdefault(f["path"], {"symbol_lines": set(), "fields": {}})
-        for s in f.get("symbols") or []:
-            entry["symbol_lines"].add(s["line"])
-            for fd in s.get("fields", []):
-                entry["symbol_lines"].add(fd["line"])
-                entry["fields"][(s["name"], fd["name"])] = fd["line"]
-    return idx
+REF_PAT = re.compile(r'\[([^\]\n]+):L(\d+)(?:-L(\d+))?\]')
+LINK_PAT = re.compile(r'\[([^\]\n]*)\]\((<[^>\n]+>|[^\s)]+)(?:\s+["\'][^\n]*?["\'])?\)')
+FIELD_PAT = re.compile(r'`(\w+)\.(\w+)`\(L(\d+)\)')
+STAT_PAT = re.compile(r'<!--\s*agentsmd:stats\s+(\{.*?\})\s*-->')
+SKIP_DIRS = {'.git', '.agentsmd', 'node_modules', 'vendor', 'dist', 'build', 'target', '__pycache__', '.venv', 'venv'}
 
 
-def find_path(idx, ref, line=None, extra=None):
-    """按路径匹配 AST 文件；行号有效时优先用它消除歧义。"""
-    if ref in idx:
-        return ref
-    ref = ref.replace("\\", "/")
-    cand = [p for p in idx if p.endswith(ref)]
-    if not cand:
+def iter_docs(root):
+    docs = []
+    for current, dirs, files in os.walk(root):
+        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not d.startswith('.'))
+        for name in files:
+            if re.fullmatch(r'(?i)agents(?:\..+)?\.md', name):
+                docs.append((Path(current) / name).relative_to(root).as_posix())
+    return sorted(docs)
+
+
+def without_fences(text):
+    lines, fence = [], None
+    for line in text.splitlines(keepends=True):
+        marker = re.match(r'^\s{0,3}(`{3,}|~{3,})', line)
+        if marker:
+            token = marker.group(1)
+            if fence is None:
+                fence = token
+            elif token[0] == fence[0] and len(token) >= len(fence):
+                fence = None
+            lines.append('\n')
+        else:
+            lines.append('\n' if fence else line)
+    return ''.join(lines)
+
+
+def root_path(root, ref):
+    path = (root / ref.replace('\\', '/')).resolve()
+    if not path.is_relative_to(root):
+        raise ValueError(f'引用越出项目根目录: {ref}')
+    return path
+
+
+def local_link_target(md, link):
+    link = link.strip('<>')
+    parsed = urlsplit(link)
+    if parsed.scheme or parsed.netloc or not parsed.path:
         return None
-    if len(cand) > 1 and line is not None:
-        hit = [p for p in cand
-               if line in idx[p]["symbol_lines"] or line in (extra or {}).get(p, set())]
-        if len(hit) == 1:
-            return hit[0]
-        return None  # 仍有歧义或全不命中，交由上层逐个判断
-    return cand[0]
+    return Path(md).parent / unquote(parsed.path)
+
+
+def validate(root, reports, docs):
+    errors, warnings, checked = [], [], 0
+    files, sources = {}, {}
+    for source, report in reports.items():
+        declared_root = report.get('root')
+        if declared_root and Path(declared_root).resolve() != root:
+            warnings.append(f'{source}: 索引 root 与项目根不同，请确认索引已重建')
+        if report.get('diagnostics'):
+            warnings.append(f'{source}: 有 {len(report["diagnostics"])} 个文件未完整分析，请检查 diagnostics')
+        for file in report.get('files') or []:
+            files.setdefault(file['path'], file)
+            sources.setdefault(file['path'], set()).add(source)
+    cache = {}
+
+    def read_source(ref):
+        if ref not in cache:
+            path = root_path(root, ref)
+            raw = path.read_bytes()
+            cache[ref] = (len(raw.splitlines()), hashlib.sha256(raw).hexdigest())
+        return cache[ref]
+
+    for ref, file in files.items():
+        try:
+            count, digest = read_source(ref)
+            if file.get('content_hash') and file['content_hash'] != digest:
+                errors.append(f'{ref}: 索引已过期，源码内容已变化，请重建索引')
+            elif 'line_end' in file and file['line_end'] != count:
+                errors.append(f'{ref}: 索引行数 {file["line_end"]} 与源码 {count} 不一致，请重建索引')
+        except (OSError, ValueError) as exc:
+            errors.append(f'{ref}: 索引文件无法读取: {exc}')
+    for source, report in reports.items():
+        if any(not f.get('content_hash') for f in report.get('files') or []):
+            warnings.append(f'{source}: 旧索引缺少内容哈希，无法完整检查新鲜度')
+
+    for md in docs:
+        text = without_fences((root / md).read_text(encoding='utf-8'))
+        for match in REF_PAT.finditer(text):
+            ref, start, end = match.group(1), int(match.group(2)), int(match.group(3) or match.group(2))
+            checked += 1
+            try:
+                count, _ = read_source(ref)
+                if not 1 <= start <= end <= count:
+                    errors.append(f'{md}: {ref}:L{start}-L{end} 超出有效范围 1..{count}')
+            except (OSError, ValueError) as exc:
+                errors.append(f'{md}: 引用文件无法读取 {ref}: {exc}')
+        for match in LINK_PAT.finditer(text):
+            label, link = match.groups()
+            target = local_link_target(md, link)
+            if target is None:
+                continue
+            checked += 1
+            path = root / target
+            if not path.exists():
+                errors.append(f'{md}: 死链 -> {link}')
+                continue
+            ref_match = re.fullmatch(r'(.+):L(\d+)(?:-L(\d+))?', label)
+            fragment = urlsplit(link.strip('<>')).fragment
+            if ref_match:
+                try:
+                    if root_path(root, ref_match.group(1)) != path.resolve():
+                        errors.append(f'{md}: 引用标签与链接目标不一致: {label} -> {link}')
+                    expected = 'L' + ref_match.group(2)
+                    if ref_match.group(3):
+                        expected += '-L' + ref_match.group(3)
+                    if fragment and fragment != expected:
+                        errors.append(f'{md}: 行号标签与锚点不一致: {label} -> {link}')
+                except ValueError as exc:
+                    errors.append(f'{md}: {exc}')
+            elif re.fullmatch(r'L\d+(?:-L\d+)?', fragment):
+                nums = [int(n) for n in re.findall(r'\d+', fragment)]
+                try:
+                    count = len(path.read_bytes().splitlines())
+                    if not 1 <= nums[0] <= nums[-1] <= count:
+                        errors.append(f'{md}: 链接锚点超出源码行数: {link}')
+                except OSError as exc:
+                    errors.append(f'{md}: {exc}')
+        # Legacy field shorthand is checked only within files cited in the same row.
+        for line in text.splitlines():
+            refs = [m.group(1) for m in REF_PAT.finditer(line)]
+            for typ, field, num in FIELD_PAT.findall(line):
+                hits = [ref for ref in refs if any(
+                    symbol.get('name') == typ and any(fd.get('name') == field and fd.get('line') == int(num)
+                                                       for fd in symbol.get('fields') or [])
+                    for symbol in files.get(ref, {}).get('symbols') or [])]
+                if len(set(hits)) != 1:
+                    warnings.append(f'{md}: 字段 {typ}.{field}(L{num}) 未在同一行引用的唯一文件中命中')
+        for match in STAT_PAT.finditer(text):
+            try:
+                spec = json.loads(match.group(1))
+                source = spec['source']
+                stats = reports[source]['stats']
+                for key in ('file_count', 'package_count', 'symbol_count'):
+                    if key in spec and spec[key] != stats.get(key):
+                        errors.append(f'{md}: {source} 的 {key} 文档值 {spec[key]} != 索引值 {stats.get(key)}')
+            except (KeyError, ValueError, TypeError) as exc:
+                errors.append(f'{md}: agentsmd:stats 标记无效: {exc}')
+        headings = '\n'.join(re.findall(r'(?m)^#{1,6}\s+(.+)$', text))
+        required = (['模块地图', '架构与数据流', '构建/运行/测试'] if Path(md).name.lower() == 'agents.md'
+                    else ['功能点清单', '依赖与协作', '测试与验证'])
+        missing = [section for section in required if section not in headings]
+        if missing:
+            warnings.append(f'{md}: 缺少建议章节: {", ".join(missing)}')
+    return list(dict.fromkeys(errors)), list(dict.fromkeys(warnings)), checked
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--root", default=".")
-    ap.add_argument("--ast", default=None)
-    ap.add_argument("--strict", action="store_true", help="统计不一致也视为失败")
-    args = ap.parse_args()
-
-    root = os.path.abspath(args.root)
-    ast_path = args.ast or os.path.join(root, ".agentsmd", "ast.json")
-    if not os.path.exists(ast_path):
-        print(f"[verify] 未找到 {ast_path}，请先运行 goast", file=sys.stderr)
-        sys.exit(1)
-
-    ast = json.load(open(ast_path, encoding="utf-8"))
-    idx = build_index(ast)
-
-    os.chdir(root)
-    docs = sorted(glob.glob("AGENTS*.md") + glob.glob("agents*.md"))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--root', default='.')
+    parser.add_argument('--ast', action='append', help='索引路径，可重复；相对当前工作目录')
+    parser.add_argument('--strict', action='store_true', help='所有警告也视为失败')
+    args = parser.parse_args()
+    root = Path(args.root).resolve()
+    paths = args.ast or [str(p) for p in (root / '.agentsmd/ast.json', root / '.agentsmd/index.json') if p.exists()]
+    if not paths:
+        parser.error('未找到索引，请先运行 goast/codeindex.py')
+    reports = {}
+    for path in paths:
+        p = Path(path).resolve()
+        name = p.relative_to(root).as_posix() if p.is_relative_to(root) else str(p)
+        reports[name] = json.loads(p.read_text(encoding='utf-8'))
+    docs = iter_docs(root)
     if not docs:
-        print("[verify] 未找到 AGENTS*.md 文档", file=sys.stderr)
-        sys.exit(1)
-
-    errors, warnings, checked = [], [], 0
-    reported = set()  # (md, ref, line) 去重，同一引用在表格中多次出现只报一次
-
-    # 路由/cron 提取的行号也是合法引用目标
-    extra_lines = {}
-    for r in ast.get("routes", []):
-        extra_lines.setdefault(r["file"], set()).add(r["line"])
-    for c in ast.get("crons", []):
-        extra_lines.setdefault(c["file"], set()).add(c["line"])
-
-    for md in docs:
-        text = open(md, encoding="utf-8").read()
-
-        # 1. 行号引用
-        for m in REF_PAT.finditer(text):
-            ref, l1 = m.group(1).replace("\\", "/"), int(m.group(2))
-            checked += 1
-            ref_norm = ref
-            cands = [p for p in idx if p == ref_norm or p.endswith(ref_norm)]
-            if cands:
-                # 任一候选文件的符号/字段/路由行命中即视为有效
-                valid = any(
-                    l1 in idx[p]["symbol_lines"] or l1 in extra_lines.get(p, set())
-                    for p in cands
-                )
-                if not valid and (md, ref, l1) not in reported:
-                    reported.add((md, ref, l1))
-                    tip = "" if len(cands) == 1 else f"（{ref} 匹配到 {len(cands)} 个文件，建议写全相对路径）"
-                    errors.append(f"{md}: {ref}:L{l1} 无符号/字段/路由起始于该行{tip}")
-            elif not os.path.exists(ref):
-                if (md, ref) not in reported:
-                    reported.add((md, ref))
-                    errors.append(f"{md}: 引用文件不存在 {ref}")
-            # 非 Go 且文件存在: 仅存在性检查通过
-
-        # 2. 字段引用
-        for m in FIELD_PAT.finditer(text):
-            typ, fld, ln = m.group(1), m.group(2), int(m.group(3))
-            found = any(e["fields"].get((typ, fld)) == ln for e in idx.values())
-            if not found and (md, typ, fld, ln) not in reported:
-                reported.add((md, typ, fld, ln))
-                # 字段可能属于非 Go 文件或无 fields 输出，降级为警告
-                warnings.append(f"{md}: 字段 `{typ}.{fld}`(L{ln}) 未在 AST 字段索引中命中")
-
-        # 3. 死链
-        for m in LINK_PAT.finditer(text):
-            link = m.group(1)
-            if link.startswith(("http://", "https://", "mailto:")):
-                continue
-            checked += 1
-            if not os.path.exists(link) and (md, link) not in reported:
-                reported.add((md, link))
-                errors.append(f"{md}: 死链 -> {link}")
-
-    # 4. 统计一致性（仅根文件，宽松）
-    root_doc = next((d for d in docs if d.upper() == "AGENTS.MD"), None)
-    if root_doc:
-        text = open(root_doc, encoding="utf-8").read()
-        st = ast["stats"]
-        for label, actual in (("文件", st["file_count"]), ("包", st["package_count"]), ("符号", st["symbol_count"])):
-            nums = [int(n) for n in re.findall(label + r"\s*\*?\*?(\d+)\*?\*?\s*个", text)]
-            if nums and actual not in nums:
-                msg = f"{root_doc}: 统计\"{label}\" 文档值 {nums} 与实际 {actual} 不一致"
-                (errors if args.strict else warnings).append(msg)
-
-    print(f"[verify] 文档 {len(docs)} 个，引用检查 {checked} 处")
-    for w in warnings:
-        print(f"  WARN {w}")
-    for e in errors:
-        print(f"  ERR  {e}")
-    if errors:
-        print(f"[verify] FAILED: {len(errors)} 个错误, {len(warnings)} 个警告")
-        sys.exit(1)
-    print(f"[verify] OK ({len(warnings)} 个警告)")
+        parser.error('未找到 AGENTS*.md 文档')
+    errors, warnings, checked = validate(root, reports, docs)
+    print(f'[verify] 索引 {len(reports)} 份，文档 {len(docs)} 个，引用检查 {checked} 处')
+    for warning in warnings:
+        print('  WARN ' + warning)
+    for error in errors:
+        print('  ERR  ' + error)
+    failed = bool(errors or (args.strict and warnings))
+    print(f'[verify] {"FAILED" if failed else "OK"}: {len(errors)} 个错误，{len(warnings)} 个警告')
+    raise SystemExit(int(failed))
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
