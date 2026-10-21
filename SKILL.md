@@ -33,6 +33,7 @@ python3 <skill_dir>/scripts/codeindex.py --root <项目根> --out <项目根>/.a
 - Python 使用标准库 AST，包含类、方法、函数、docstring、参数/返回类型、imports 和精确声明范围；导出性只是下划线命名惯例。
 - TS/JS/Java/Kotlin/Rust/C/C++/SQL/proto/shell 使用正则，只给声明行；`exported: null` 表示未知，不能据此列为公共 API。复杂嵌套、多行声明和动态导入可能遗漏。所有重要引用均打开源码核实。
 - `routes` / `crons` 是 **候选线索**：路由接收者不一定为 HTTP 框架，路径可能缺少分组前缀，handlers 可能含中间件；cron 字符串或注释不代表已注册、启用或使用指定时区。必须阅读注册调用和配置后再写成接口/任务。
+- 先按候选的 `is_test` 区分生产与测试来源（旧索引可关联 `files[].is_test`）；测试专用路由和示例表达式只作测试证据。未提取到生产 cron 字符串不代表没有调度，应继续阅读 Manifest/YAML 和动态注册代码。
 - `context.json` 的分类与入口文件名也只是候选。`files[].facts` 提供可解析的 `go.mod`、`package.json` 和构建目标证据，其他 manifest 需要自行阅读。JSON 事实用 `json_pointer` 定位，不伪造行号。
 
 ## 2. 阅读实现，建立模块地图
@@ -87,6 +88,8 @@ python3 <skill_dir>/scripts/callgraph.py --ast <项目根>/.agentsmd/ast.json --
 python3 <skill_dir>/scripts/verify.py --root <项目根>
 # 需要警告也判失败时使用 --strict
 ```
+
+默认会检查已有协作指令与模板文档，可能出现与导览格式无关的结构警告。需要只验收本次交付时，重复指定 `--doc AGENTS.md --doc AGENTS.<模块名>.md`（相对项目根）；不要为消除旧模板的章节警告而改写其指令。
 
 校验器递归检查 `AGENTS*.md` 的文件/行号范围、链接目标一致性、索引内容哈希及显式统计标记；不会判断功能描述语义，也不验证任意 Markdown 章节锚点。源码语句和配置行也是合法证据，不必强行引用符号起始行。零错误通过后逐条复核警告，并人工确认：
 
