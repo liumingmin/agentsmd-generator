@@ -6,6 +6,7 @@ Without a module declaration, no directory-suffix guesses are made.
 """
 import argparse
 import json
+from artifacts import read_json
 import re
 from collections import defaultdict
 from pathlib import Path
@@ -71,7 +72,14 @@ def file_dependencies(report, root):
             edges[path].update(packages[directory] - {path})  # implicit same-package references
             for target in go_edges.get(directory, []): edges[path].update(packages[target])
             continue
+        resolved = {item['import']: item['path'] for item in file.get('resolved_imports', [])}
+        for item in file.get('unresolved_imports', []):
+            if not item.get('import'):
+                unresolved.append({'file': path, **item})
         for imp in file.get('imports') or []:
+            if imp in resolved and resolved[imp] in files:
+                edges[path].add(resolved[imp])
+                continue
             candidates = []
             if Path(path).suffix in js_exts and imp.startswith('.'):
                 base = (root / Path(path).parent / imp).resolve()
@@ -104,7 +112,7 @@ def main():
     parser.add_argument('--module', default='', help='覆盖根 go.mod 的 module')
     parser.add_argument('--group-depth', type=int, default=2)
     args = parser.parse_args()
-    report = json.loads(Path(args.ast).read_text(encoding='utf-8'))
+    report = read_json(args.ast)
     edges = import_edges(report, args.root or report.get('root', '.'), args.module)
     print('## 包依赖图（精确 import 匹配，不代表运行时调用）\n\n```')
     for src in sorted(edges):

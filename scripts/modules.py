@@ -41,15 +41,17 @@ def plan(root, reports, max_files=64, max_symbols=500):
                   'children': sorted(groups) if split else [], 'files': owned,
                   'stats': counts(files[p] for p in owned),
                   'oversized': oversized, 'needs_manual_split': oversized and not split,
-                  'review': {'entrypoint': [], 'implementation': [],
+                  'review': {'scope': 'unreviewed', 'reviewed_files': [], 'exclusions': [],
+                             'source_hashes': {}, 'capabilities': [], 'entrypoint': [], 'implementation': [],
                              'test': {'status': 'not_reviewed', 'reason': ''}}}
         modules.append(module)
         if split:
             for child, paths in sorted(groups.items()):
                 add(child, paths, directory)
     add('.', sorted(files))
-    return {'schema_version': 1, 'root': str(Path(root).resolve()), 'status': 'candidate',
+    return {'schema_version': 2, 'root': str(Path(root).resolve()), 'status': 'candidate',
             'scope': reports[0].get('scope'), 'root_module': '.',
+            'delivery': {'mode': 'draft', 'scope_confirmed': False},
             'budgets': {'max_files': max_files, 'max_symbols': max_symbols},
             'source_count': len(files), 'modules': modules,
             'index_coverage': {'source_count': len(files), 'indexed_count': len(files) - len(unindexed),
@@ -59,11 +61,12 @@ def plan(root, reports, max_files=64, max_symbols=500):
 
 
 def linked_documents(root, document):
-    from verify import LINK_PAT, without_fences
-    text = without_fences(safe_path(root, document).read_text(encoding='utf-8'))
+    from markdownlinks import links
+    text = safe_path(root, document).read_text(encoding='utf-8')
     result = set()
-    for match in LINK_PAT.finditer(text):
-        parsed = urlsplit(match.group(2).strip('<>'))
+    for link in links(text):
+        if link.image: continue
+        parsed = urlsplit(link.target)
         if not parsed.scheme and not parsed.netloc and parsed.path:
             target = (safe_path(root, document).parent / unquote(parsed.path)).resolve()
             if target.is_relative_to(root):
@@ -72,12 +75,22 @@ def linked_documents(root, document):
 
 
 def check(root, mapping, reports, documents=True, require_reviewed=False):
+    from schemas import mapping_errors
+    errors, warnings = mapping_errors(mapping), []
+    if errors: return errors, warnings
+    from guidepaths import validate_targets
+    try:
+        validate_targets(root, [m['document'] for m in mapping['modules']])
+    except ValueError as exc:
+        return [str(exc)], []
     root = Path(root).resolve()
-    errors, warnings = [], []
     if Path(mapping.get('root', '')).resolve() != root:
         errors.append('module map root mismatch')
     if mapping.get('scope') != reports[0].get('scope'):
         errors.append('module map scope is stale; reconcile source ownership')
+    delivery = mapping.get('delivery', {})
+    if require_reviewed and (delivery.get('mode') != 'complete' or delivery.get('scope_confirmed') is not True):
+        errors.append('complete delivery requires confirmed module boundaries and delivery.mode=complete')
     sources = source_files(reports)
     unindexed = sorted(p for p, f in sources.items() if 'symbols' not in f)
     if unindexed:
@@ -94,6 +107,7 @@ def check(root, mapping, reports, documents=True, require_reviewed=False):
     root_id = mapping.get('root_module')
     if root_id not in by_id or by_id[root_id].get('parent') is not None:
         errors.append('invalid root module')
+    test_inputs = None
     for module in modules:
         mid = module['id']
         parent = module.get('parent')
@@ -116,6 +130,35 @@ def check(root, mapping, reports, documents=True, require_reviewed=False):
             warnings.append(f'{mid}: exceeds budget without directory split; group by verified responsibility')
         review = module.get('review', {})
         missing = []
+        scope = review.get('scope', 'unreviewed')
+        if scope not in ('unreviewed', 'sampled', 'complete'):
+            errors.append(f'{mid}: invalid review.scope')
+        if module.get('files') and scope != 'complete':
+            (errors if require_reviewed else warnings).append(f'{mid}: review scope is {scope}; not a complete review')
+        complete = require_reviewed or scope == 'complete'
+        if module.get('files') and (complete or scope == 'sampled'):
+            from reviewstate import freshness
+            (errors if complete else warnings).extend(freshness(root, module, sources))
+        if documents and scope == 'sampled':
+            try:
+                content = safe_path(root, module['document']).read_text(encoding='utf-8')
+                from verify import without_fences
+                if not re.search(r'抽样|未完成|sampled|partial', without_fences(content), re.I):
+                    errors.append(f'{mid}: sampled review must be visible in document')
+            except (OSError, ValueError):
+                pass  # Document errors are reported by navigation checks below.
+        if complete and module.get('files'):
+            reviewed = review.get('reviewed_files', [])
+            exclusions = review.get('exclusions', [])
+            excluded = [entry.get('path') for entry in exclusions]
+            if any(not entry.get('reason', '').strip() for entry in exclusions):
+                errors.append(f'{mid}: review exclusions require reasons')
+            accounted = reviewed + excluded
+            if len(set(accounted)) != len(accounted) or set(accounted) != set(module['files']):
+                errors.append(f'{mid}: every owned source needs exactly one reviewed/excluded disposition')
+            if not set(review.get('entrypoint', []) + review.get('implementation', [])) <= set(reviewed):
+                errors.append(f'{mid}: entrypoint/implementation must be in reviewed_files')
+            errors.extend(check_capabilities(mid, review.get('capabilities', [])))
         for role in ('entrypoint', 'implementation'):
             refs = review.get(role, [])
             if module.get('files') and not refs:
@@ -137,10 +180,21 @@ def check(root, mapping, reports, documents=True, require_reviewed=False):
                 errors.append(f'{mid}: test execution metadata missing')
             elif (execution['exit_code'] == 0) != (status == 'passed'):
                 errors.append(f'{mid}: test result contradicts exit code')
+            try:
+                from teststate import snapshot, freshness as test_freshness
+                if test_inputs is None: test_inputs = snapshot(root, reports)
+                (errors if complete else warnings).extend(f'{mid}: {message}' for message in test_freshness(execution, test_inputs))
+            except (OSError, ValueError) as exc:
+                errors.append(f'{mid}: test inputs unavailable: {exc}')
         if missing:
             (errors if require_reviewed else warnings).append(f"{mid}: unreviewed {', '.join(missing)}")
         if documents:
             try:
+                if require_reviewed or scope == 'complete':
+                    from completeness import unfinished, section_errors
+                    content = safe_path(root, module['document']).read_text(encoding='utf-8')
+                    errors.extend(f'{mid}: {message}' for message in unfinished(content))
+                    errors.extend(f'{mid}: {message}' for message in section_errors(content, mid == root_id))
                 links = linked_documents(root, module['document'])
                 required = module.get('children', []) + ([parent] if parent in by_id else [])
                 for other in required:
@@ -157,9 +211,39 @@ def check(root, mapping, reports, documents=True, require_reviewed=False):
     return list(dict.fromkeys(errors)), list(dict.fromkeys(warnings))
 
 
+ASPECTS = ('input', 'success', 'failure', 'configuration')
+
+
+def check_capabilities(mid, capabilities):
+    errors = []
+    if not capabilities:
+        return [f'{mid}: complete review requires a major capability checklist']
+    ids = [item.get('id') for item in capabilities]
+    if any(not isinstance(cid, str) or not re.fullmatch(r'[A-Za-z0-9_.:-]+', cid) for cid in ids) or len(set(ids)) != len(ids):
+        errors.append(f'{mid}: capability IDs must be valid and unique')
+    for capability in capabilities:
+        cid = capability.get('id')
+        if not capability.get('title') or capability.get('status') != 'reviewed':
+            errors.append(f'{mid}/{cid}: capability is pending or lacks a title')
+        if not capability.get('claims'):
+            errors.append(f'{mid}/{cid}: capability needs primary claims')
+        aspects = capability.get('aspects', {})
+        for aspect in ASPECTS:
+            item = aspects.get(aspect, {})
+            if item.get('status') == 'covered':
+                if not item.get('claims'):
+                    errors.append(f'{mid}/{cid}/{aspect}: covered aspect needs claims')
+            elif item.get('status') == 'not_applicable':
+                if not item.get('reason', '').strip():
+                    errors.append(f'{mid}/{cid}/{aspect}: not_applicable needs a reason')
+            else:
+                errors.append(f'{mid}/{cid}/{aspect}: unresolved capability aspect')
+    return errors
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('command', choices=['plan', 'check'])
+    ap.add_argument('command', choices=['plan', 'check', 'record-review'])
     ap.add_argument('--root', default='.')
     ap.add_argument('--report', action='append')
     ap.add_argument('--map', dest='mapping')
@@ -168,6 +252,9 @@ def main():
     ap.add_argument('--force', action='store_true')
     ap.add_argument('--no-docs', action='store_true')
     ap.add_argument('--require-reviewed', action='store_true')
+    ap.add_argument('--module', action='append', help='module ID explicitly reread; repeatable for record-review')
+    from diagnostics import add_arguments
+    add_arguments(ap)
     args = ap.parse_args()
     root = Path(args.root).resolve()
     path = Path(args.mapping) if args.mapping else root / '.agentsmd/modules.json'
@@ -178,13 +265,20 @@ def main():
                 ap.error('module map exists; write candidates elsewhere or use --force')
             write_json(path, plan(root, reports, args.max_files, args.max_symbols))
             print(path)
+        elif args.command == 'record-review':
+            if not args.module: raise ValueError('record-review requires --module for each reread module')
+            from reviewstate import record
+            write_json(path, record(root, read_json(path), reports, args.module))
+            print(f'Recorded source hashes for {len(set(args.module))} module(s); review scope and test status unchanged')
         else:
             errors, warnings = check(root, read_json(path), reports, not args.no_docs, args.require_reviewed)
-            for message in warnings: print('WARN ' + message)
-            for message in errors: print('ERR ' + message)
+            from diagnostics import render
+            render(errors, warnings, mapping=read_json(path), options=args)
             raise SystemExit(bool(errors))
     except (OSError, ValueError, KeyError) as exc:
-        ap.error(str(exc))
+        from diagnostics import render
+        render(getattr(exc, 'errors', [str(exc)]), [], options=args)
+        raise SystemExit(1)
 
 
 if __name__ == '__main__':

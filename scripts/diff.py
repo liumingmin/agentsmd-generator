@@ -7,16 +7,55 @@ semantically up to date merely because symbols have the same signatures.
 """
 import argparse
 import json
+from artifacts import read_json
 import re
 from pathlib import Path
-from verify import REF_PAT, LINK_PAT, iter_docs, local_link_target, without_fences
+from verify import REF_PAT, iter_docs, local_link_target
 
 
 def symbols_by_id(file):
     from scanpolicy import finalize_symbols
     import copy
-    symbols = finalize_symbols(copy.deepcopy(file.get('symbols') or []))
+    symbols = copy.deepcopy(file.get('symbols') or [])
+    if any(not s.get('id') for s in symbols):
+        finalize_symbols(symbols)
     return {s['id']: s for s in symbols}
+
+
+def match_symbols(before, after):
+    """Match exact content, then unique contracts, then a single remaining declaration.
+
+    Multiple unmatched declarations are intentionally left ambiguous. Declaration
+    order is never evidence that two overloaded implementations are the same.
+    """
+    pairs, ambiguous = [], set()
+    if before.get('symbols') == after.get('symbols'):
+        old, new = symbols_by_id(before), symbols_by_id(after)
+        return [((sid, old[sid]), (sid, new[sid])) for sid in old], ambiguous
+    groups = {}
+    for side, file in ((0, before), (1, after)):
+        for sid, symbol in symbols_by_id(file).items():
+            groups.setdefault((symbol['kind'], symbol['name']), [[], []])[side].append((sid, symbol))
+    for key, (old, new) in sorted(groups.items()):
+        for field in ('content_hash', 'signature_hash'):
+            values = sorted({s.get(field) for _, s in old if s.get(field)} & {s.get(field) for _, s in new if s.get(field)})
+            for value in values:
+                left = [item for item in old if item[1].get(field) == value]
+                right = [item for item in new if item[1].get(field) == value]
+                if len(left) == len(right) == 1:
+                    pairs.append((left[0], right[0]))
+                    old.remove(left[0]); new.remove(right[0])
+        same_content = {symbol.get('content_hash') for _, symbol in old + new}
+        if len(old) == len(new) > 1 and len(same_content) == 1 and None not in same_content:
+            pairs.extend(zip(sorted(old, key=lambda item: item[1]['line']), sorted(new, key=lambda item: item[1]['line'])))
+            old, new = [], []
+        if len(old) == len(new) == 1:
+            pairs.append((old.pop(), new.pop()))
+        if old and new:
+            ambiguous.add(key)
+        pairs.extend((item, None) for item in old)
+        pairs.extend((None, item) for item in new)
+    return pairs, ambiguous
 
 
 def compare(old, new):
@@ -36,8 +75,21 @@ def compare(old, new):
             if content_changed:
                 reasons.append('内容变化（含函数体、注释或配置，需复核行为）')
             osym, nsym = symbols_by_id(before), symbols_by_id(after)
-            for sid in sorted(osym.keys() | nsym.keys()):
-                a, b = osym.get(sid), nsym.get(sid)
+            pairs, ambiguous = match_symbols(before, after)
+            if ambiguous:
+                structural = True
+                reasons.append('ambiguous duplicate declarations; review without guessing identity')
+            matched = [(i, old_item[1], new_item[1]) for i, (old_item, new_item) in enumerate(pairs)
+                       if old_item and new_item]
+            old_order = [i for i, a, b in sorted(matched, key=lambda item: (item[1]['line'], item[1]['name']))]
+            new_order = [i for i, a, b in sorted(matched, key=lambda item: (item[2]['line'], item[2]['name']))]
+            if old_order != new_order:
+                structural = True
+                reasons.append('声明顺序变化（需复核初始化、装饰器或重定义影响）')
+            for old_item, new_item in pairs:
+                a = old_item[1] if old_item else None
+                b = new_item[1] if new_item else None
+                sid = new_item[0] if new_item else old_item[0]
                 kinds = []
                 if a is None or b is None:
                     kinds.append('added' if a is None else 'deleted'); structural = True
@@ -56,14 +108,15 @@ def compare(old, new):
                         kinds.append('syntax')
                 if kinds:
                     symbol = b or a
-                    details.append({'id': sid, 'name': symbol['name'], 'kinds': kinds,
+                    details.append({'id': sid, 'before_id': old_item[0] if old_item else None,
+                                    'after_id': new_item[0] if new_item else None, 'name': symbol['name'], 'kinds': kinds,
                                     'before': {'line': a['line'], 'end_line': a['end_line']} if a else None,
                                     'after': {'line': b['line'], 'end_line': b['end_line']} if b else None})
                     reasons.append(f"符号 {symbol['name']} 变化: {', '.join(kinds)}")
             # Parent class hashes include child bodies; avoid treating the whole class as
             # an independent implementation edit when only an indexed method changed.
             for detail in details:
-                symbol = nsym.get(detail['id']) or osym.get(detail['id'])
+                symbol = nsym.get(detail['after_id']) or osym.get(detail['before_id'])
                 if symbol['kind'] == 'class' and 'syntax' in detail['kinds'] and any(
                     other['name'].startswith(detail['name'] + '.') and any(k in other['kinds'] for k in ('body', 'contract', 'added', 'deleted'))
                     for other in details):
@@ -73,7 +126,7 @@ def compare(old, new):
                 if isinstance(value, list): return [contract_metadata(item) for item in value]
                 if isinstance(value, dict): return {k: contract_metadata(v) for k, v in value.items() if k not in ('line', 'end_line')}
                 return value
-            for key in ('imports', 'exports', 'facts', 'categories', 'build_constraints', 'generated'):
+            for key in ('imports', 'exports', 'facts', 'categories', 'build_constraints', 'generated', 'resolved_imports', 'resolution_configs'):
                 if contract_metadata(before.get(key)) != contract_metadata(after.get(key)):
                     reasons.append(key + '变化'); structural = True
             for key in ('line_end', 'size_bytes'):
@@ -147,7 +200,7 @@ def impact(root, old, new, changes, unknown=(), mapping=None, ledger=None):
                 for symbol in change['symbols']:
                     before = symbol.get('before')
                     overlaps = before and ref['line'] <= before['end_line'] and ref.get('end_line', ref['line']) >= before['line']
-                    if symbol['id'] == ref.get('symbol_id') or overlaps:
+                    if ref.get('symbol_id') in {symbol['id'], symbol.get('before_id')} or overlaps:
                         reasons.append(f"{path}: {symbol['id']} {','.join(symbol['kinds'])}")
         if reasons: claims.append({'id': claim['id'], 'document': claim['document'], 'reasons': sorted(set(reasons))})
     return {'files': sorted(reached), 'dependency_causes': cause, 'modules': affected_modules, 'claims': claims,
@@ -157,20 +210,26 @@ def impact(root, old, new, changes, unknown=(), mapping=None, ledger=None):
 
 
 def affected_docs(root, changed):
+    from bisect import bisect_right
+    from collections import defaultdict
+    import markdownlinks
     affected = {}
     for md in iter_docs(root):
-        text = without_fences((root / md).read_text(encoding='utf-8'))
+        text = (root / md).read_text(encoding='utf-8')
+        links, visible = markdownlinks.analyze(text)
+        newlines = [i for i, char in enumerate(text) if char == '\n']
+        linked = defaultdict(set)
+        for link in links:
+            target = local_link_target(md, link.target)
+            if target is not None:
+                refs = linked[bisect_right(newlines, link.start) + 1]
+                refs.add(Path(target).as_posix())
+                try: refs.add((root / target).resolve().relative_to(root).as_posix())
+                except ValueError: pass
         hits = []
-        for n, line in enumerate(text.splitlines(), 1):
+        for n, line in enumerate(visible.splitlines(), 1):
             refs = {m.group(1).replace('\\', '/') for m in REF_PAT.finditer(line)}
-            for match in LINK_PAT.finditer(line):
-                target = local_link_target(md, match.group(2))
-                if target is not None:
-                    refs.add(Path(target).as_posix())
-                    try:
-                        refs.add((root / target).resolve().relative_to(root).as_posix())
-                    except ValueError:
-                        pass
+            refs.update(linked[n])
             matches = changed & refs
             if matches:
                 hits.append((n, ', '.join(sorted(matches))))
@@ -188,8 +247,11 @@ def main():
     parser.add_argument('--evidence')
     parser.add_argument('--json', action='store_true', help='structured report to stdout')
     args = parser.parse_args()
-    old = json.loads(Path(args.old).read_text(encoding='utf-8'))
-    new = json.loads(Path(args.new).read_text(encoding='utf-8'))
+    import snapshots
+    parents = {str(Path(path).parent.resolve()) for path in (args.old, args.new)}
+    pinned = {parent: snapshots.manifest(parent) for parent in parents}
+    old = snapshots.read_report(args.old, pinned[str(Path(args.old).parent.resolve())])
+    new = snapshots.read_report(args.new, pinned[str(Path(args.new).parent.resolve())])
     changes, unknown = compare(old, new)
     root = Path(args.root).resolve()
     mapping_path = Path(args.mapping) if args.mapping else root / '.agentsmd/modules.json'
@@ -199,7 +261,8 @@ def main():
     effects = impact(root, old, new, changes, unknown, mapping, ledger)
     if args.json:
         print(json.dumps({'changes': changes, 'unknown': unknown, 'impact': effects,
-                          'scope_changed': old.get('scope') != new.get('scope')}, ensure_ascii=False, indent=2))
+                          'scope_changed': old.get('scope') != new.get('scope'),
+                          'analyzer_changed': old.get('analysis_revision') != new.get('analysis_revision')}, ensure_ascii=False, indent=2))
         return
     changed = {c['path'] for c in changes}
     print('# 增量更新报告\n')
@@ -218,6 +281,8 @@ def main():
     for mid, item in effects['modules'].items(): print(f"- {mid} → {item['document']}")
     for claim in effects['claims']: print(f"- {claim['id']}: " + '; '.join(claim['reasons']))
     print(f"未解析 import {len(effects['unresolved_imports'])} 条（含外部依赖和别名），需结合源码判断。")
+    if old.get('analysis_revision') != new.get('analysis_revision'):
+        print('分析器实现版本变化：索引差异可能来自解析能力变化，请重建可比基线。')
     if old.get('scope') != new.get('scope'): print('扫描范围变化：先复核模块归属，再判断代码增量。')
     if unknown:
         print('\n部分文件未记录内容哈希（旧索引或扫描限制），无法排除内容变化；请结合源码/git diff 和 diagnostics 复核。')

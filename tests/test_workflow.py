@@ -51,7 +51,7 @@ class Workflow(unittest.TestCase):
         reports = self.reports()
         mapping = modules.plan(self.root, reports)
         self.docs(mapping)
-        self.write('AGENTS.md', '<!-- agentsmd:claim service-run -->\nrun 返回输入加一。\n<!-- agentsmd:endclaim -->\n')
+        self.write('AGENTS.md', '<!-- agentsmd:claim service-run -->\nrun 返回输入加一。\n[service.py:L1-L2](service.py#L1-L2)\n<!-- agentsmd:endclaim -->\n')
         symbol = reports[1]['files'][1]['symbols'][0]
         self.assertEqual(symbol['name'], 'run')
         draft = {'claims': [{'id': 'service-run', 'module': '.', 'document': 'AGENTS.md', 'kind': 'behavior',
@@ -245,10 +245,19 @@ class Workflow(unittest.TestCase):
             self.write(path, source)
             reports = self.reports()
             mapping = modules.plan(self.root, reports)
-            self.write('AGENTS.md', '<!-- agentsmd:claim primary -->\n已核实的声明或断言。\n<!-- agentsmd:endclaim -->\n')
+            self.write('AGENTS.md', f'<!-- agentsmd:claim primary -->\n已核实的声明或断言。\n[{path}:L1]({path}#L1)\n<!-- agentsmd:endclaim -->\n')
             ledger = evidence.capture(self.root, {'claims': [{'id': 'primary', 'module': '.',
                 'document': 'AGENTS.md', 'kind': kind, 'status': 'confirmed',
                 'evidence': [{'role': role, 'path': path, 'line': 1}]}]}, reports)
+            ledger['claims'][0].update(capability='primary', aspect='success')
+            mapping['modules'][0]['review']['capabilities'] = [{'id': 'primary', 'title': 'Primary declarations/assertions',
+                'status': 'reviewed', 'claims': ['primary'], 'aspects': {
+                    'success': {'status': 'covered', 'claims': ['primary']},
+                    **{aspect: {'status': 'not_applicable', 'reason': 'Declaration or isolated assertion fixture'}
+                       for aspect in ('input', 'failure', 'configuration')}}}]
+            from reviewstate import record
+            mapping['modules'][0]['review']['scope'] = 'sampled'
+            mapping = record(self.root, mapping, reports, ['.'])
             self.assertEqual(evidence.check(self.root, ledger, mapping, reports, require_modules=True)[0], [])
             (self.root / path).unlink()
 
@@ -268,8 +277,18 @@ class Workflow(unittest.TestCase):
         reports, mapping, ledger = self.fixture()
         mapping['modules'][0]['review'] = {'entrypoint': ['service.py'], 'implementation': ['service.py'],
                                          'test': {'status': 'not_found', 'reason': 'Searched selected fixture sources; none are tests'}}
+        mapping['delivery'] = {'mode': 'complete', 'scope_confirmed': True}
+        review = mapping['modules'][0]['review']
+        review.update(scope='complete', reviewed_files=['service.py', 'caller.py'], exclusions=[],
+                      capabilities=[{'id': 'run', 'title': 'Run fixture', 'status': 'reviewed', 'claims': ['service-run'],
+                                     'aspects': {'success': {'status': 'covered', 'claims': ['service-run']},
+                                                 **{aspect: {'status': 'not_applicable', 'reason': 'Fixture scope has no such behavior'}
+                                                    for aspect in ('input', 'failure', 'configuration')}}}])
+        ledger['claims'][0].update(capability='run', aspect='success')
+        from reviewstate import record
+        mapping = record(self.root, mapping, reports, ['.'])
         with (self.root / 'AGENTS.md').open('a') as stream:
-            stream.write('\n## 模块地图\n## 架构与数据流\n## 构建/运行/测试\n')
+            stream.write('\n## 项目定位\n计算输入加一的独立样例。\n## 模块地图\nservice 和 caller 为入口与调用方。\n## 架构与数据流\ncaller 调用 service 后返回结果。\n## 构建/运行/测试\n使用 Python 直接调用；未发现测试，无构建步骤。\n')
         for name, report in zip(('context', 'index'), reports):
             write_json(self.root / f'.agentsmd/{name}.json', report)
         write_json(self.root / '.agentsmd/modules.json', mapping)

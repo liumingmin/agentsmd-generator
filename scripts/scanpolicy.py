@@ -49,13 +49,31 @@ def counts(files):
 
 
 def finalize_symbols(symbols):
-    seen = {}
+    groups = {}
     for symbol in symbols:
-        key = (symbol['kind'], symbol['name'])
-        ordinal = seen.get(key, 0)
-        seen[key] = ordinal + 1
-        # Position-independent identity. An ordinal preserves repeated init/overload declarations.
-        symbol['id'] = f'{key[0]}:{key[1]}#{ordinal}'
+        groups.setdefault((symbol['kind'], symbol['name']), []).append(symbol)
+    for (kind, name), members in groups.items():
+        signatures = {}
+        for symbol in members:
+            fingerprint = symbol.get('signature_hash') or ''
+            signatures[fingerprint] = signatures.get(fingerprint, 0) + 1
+        used = {}
+        for symbol in members:
+            base = f'{kind}:{name}'
+            signature = symbol.get('signature_hash')
+            content = symbol.get('content_hash')
+            if len(members) == 1:
+                identity, quality = base + '#0', 'unique-name'
+            elif signature and signatures[signature] == 1:
+                identity, quality = base + '@' + signature[:16], 'signature'
+            elif content:
+                identity, quality = base + '@' + content[:16], 'content'
+            else:
+                identity, quality = base, 'declaration-order'
+            ordinal = used.get(identity, 0)
+            used[identity] = ordinal + 1
+            symbol['id'] = identity + (f'#{ordinal}' if quality == 'declaration-order' or ordinal else '')
+            symbol['identity_quality'] = quality if not ordinal else 'ambiguous-identical'
     return symbols
 
 
@@ -88,6 +106,7 @@ def policy_options(root, excludes=(), respect_gitignore=None):
 
 def select_files(root, excludes=(), respect_gitignore=None):
     root = Path(root).resolve()
+    excludes = list(excludes)
     if not root.is_dir():
         raise ValueError(f'Not a directory: {root}')
     policy = policy_options(root, excludes, respect_gitignore)
@@ -124,16 +143,31 @@ def select_files(root, excludes=(), respect_gitignore=None):
             if path.is_file():
                 selected.append(rel)
     selected.sort()
-    scope = {'policy': policy, 'gitignore_applied': git_files is not None,
+    scope = {'policy': policy, 'options': {'exclude': sorted(set(excludes)), 'respect_gitignore': respect_gitignore},
+             'gitignore_applied': git_files is not None,
              'selection_hash': digest('\n'.join(selected))}
     return {'schema_version': 1, 'root': str(root), 'files': selected, 'scope': scope, 'diagnostics': diagnostics}
+
+
+def current_selection(root, scope):
+    """Reapply explicit CLI options to today's config, never replay merged policy."""
+    options = scope.get('options') if isinstance(scope, dict) else None
+    if not isinstance(options, dict) or 'exclude' not in options or 'respect_gitignore' not in options:
+        raise ValueError('legacy scan scope lacks option provenance; rerun analyze.py to rebuild the selection')
+    excludes, respect = options['exclude'], options['respect_gitignore']
+    if not isinstance(excludes, list) or any(not isinstance(p, str) for p in excludes) or (respect is not None and type(respect) is not bool):
+        raise ValueError('invalid scan option provenance; rerun analyze.py')
+    return select_files(root, excludes, respect)
 
 
 def load_selection(root, selection=None, excludes=(), respect_gitignore=None):
     root = Path(root).resolve()
     if selection is None:
         return select_files(root, excludes, respect_gitignore)
-    data = json.loads(Path(selection).read_text(encoding='utf-8')) if not isinstance(selection, dict) else selection
+    from artifacts import read_json
+    from schemas import require, selection_errors
+    data = read_json(selection) if not isinstance(selection, dict) else selection
+    require(selection_errors(data))
     if Path(data['root']).resolve() != root:
         raise ValueError('selection root does not match project root')
     if len(set(data['files'])) != len(data['files']):

@@ -2,7 +2,6 @@
 """Analyze one immutable file selection; preserve review artifacts and old snapshots."""
 import argparse
 import os
-import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -31,7 +30,7 @@ def main():
     try:
         selection = from_args(args)
         context = projectcontext.scan(root, selection=selection)
-        index = codeindex.scan(root, selection, js_parser=args.js_parser, typescript=args.typescript, node=args.node)
+        index = codeindex.scan(root, selection, js_parser=args.js_parser, typescript=args.typescript, node=args.node, tsconfig=args.tsconfig)
         reports = [context, index]
         # Stage every report first: failed parses/builds never partially replace the baseline.
         with tempfile.TemporaryDirectory(prefix='agentsmd-analysis-') as temporary:
@@ -50,16 +49,28 @@ def main():
             write_json(stage / 'context.json', context)
             write_json(stage / 'index.json', index)
             write_json(stage / 'module-candidates.json', modules.plan(root, reports, args.max_files, args.max_symbols))
-            out.mkdir(parents=True, exist_ok=True)
-            for name in ('selection.json', 'context.json', 'index.json', 'ast.json', 'module-candidates.json'):
-                target = out / name
-                if target.exists():
-                    shutil.copy2(target, out / name.replace('.json', '.old.json'))
-                if (stage / name).exists():
-                    os.replace(stage / name, target) if os.stat(stage).st_dev == os.stat(out).st_dev else shutil.copy2(stage / name, target)
-                elif target.exists():
-                    target.unlink()  # Do not leave a previous Go report masquerading as current.
-        print(f'Analysis: {out}; {len(selection["files"])} selected assets')
+            from snapshots import publish
+            from artifacts import read_json
+            values = {path.name: read_json(path) for path in stage.iterdir() if path.suffix == '.json'}
+            from scanpolicy import digest
+            skill_scripts = Path(__file__).parent
+            implementation = ['analyze.py', 'artifacts.py', 'snapshots.py', 'codeindex.py', 'jsindex.cjs',
+                              'scanpolicy.py', 'projectcontext.py', 'modules.py', 'goast/main.go']
+            revision = digest(b'\n'.join(name.encode() + b':' + (skill_scripts / name).read_bytes() for name in implementation))
+            for value in values.values():
+                value['analysis_revision'] = revision
+            # Validate source contents and selection again before publishing a coherent bundle.
+            from artifacts import file_map
+            from scanpolicy import digest, current_selection
+            for path, file in file_map(reports).items():
+                if file.get('content_hash') and digest((root / path).read_bytes()) != file['content_hash']:
+                    raise ValueError(f'source changed during analysis: {path}; rerun')
+            if current_selection(root, selection['scope'])['scope'] != selection['scope']:
+                raise ValueError('file selection changed during analysis; rerun')
+            generation = publish(out, values)
+        print(f'Analysis: {out} (generation {generation["snapshot_id"]}); {len(selection["files"])} selected assets')
+        for warning in generation.get('reference_warnings', []):
+            print('  WARN ' + warning)
         for report in reports:
             print(f"  {report['stats']['file_count']} files; {len(report.get('diagnostics', []))} diagnostics")
             for notice in report.get('notices', []): print('  NOTICE ' + notice)

@@ -214,7 +214,7 @@ def regex_index(lines, rules, lang):
     return symbols
 
 
-def scan(root, selection=None, allow=None, js_parser="auto", typescript=None, node="node"):
+def scan(root, selection=None, allow=None, js_parser="auto", typescript=None, node="node", tsconfig=None):
     root = Path(root).resolve()
     selection = load_selection(root, selection)
     files, diagnostics, notices = [], list(selection["diagnostics"]), []
@@ -223,7 +223,7 @@ def scan(root, selection=None, allow=None, js_parser="auto", typescript=None, no
     js_paths = [p for p in paths if EXT2LANG[Path(p).suffix.lower()] in {"typescript", "javascript"}]
     parsed_js = False
     if js_paths and js_parser != "regex":
-        payload = {"root": str(root), "files": js_paths, "typescript": typescript}
+        payload = {"root": str(root), "files": js_paths, "typescript": typescript, "tsconfig": tsconfig}
         try:
             run = subprocess.run([node, str(Path(__file__).with_name("jsindex.cjs"))],
                                  input=json.dumps(payload), text=True, capture_output=True, timeout=180)
@@ -268,6 +268,7 @@ def scan(root, selection=None, allow=None, js_parser="auto", typescript=None, no
 def parser_arguments(ap):
     ap.add_argument("--js-parser", choices=["auto", "typescript", "regex"], default="auto")
     ap.add_argument("--typescript", help="local TypeScript compiler module directory or typescript.js")
+    ap.add_argument("--tsconfig", help="explicit local JS/TS resolution config; otherwise nearest config")
     ap.add_argument("--node", default="node")
 
 
@@ -281,7 +282,7 @@ def main():
     args = ap.parse_args()
     allow = {"." + e.strip().lower().lstrip(".") for e in args.ext.split(",") if e.strip()}
     try:
-        report = scan(args.root, from_args(args), allow, args.js_parser, args.typescript, args.node)
+        report = scan(args.root, from_args(args), allow, args.js_parser, args.typescript, args.node, args.tsconfig)
     except ValueError as exc:
         ap.error(str(exc))
     data = json.dumps(report, ensure_ascii=False, indent=2) + "\n"

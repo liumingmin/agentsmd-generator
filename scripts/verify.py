@@ -63,8 +63,11 @@ def local_link_target(md, link):
     return Path(md).parent / unquote(parsed.path)
 
 
-def validate(root, reports, docs):
-    errors, warnings, checked = [], [], 0
+def validate(root, reports, docs, root_document=None):
+    from schemas import report_errors
+    errors = [error for source, report in reports.items() for error in report_errors(report, source)]
+    warnings, checked = [], 0
+    if errors: return errors, warnings, checked
     files, sources = {}, {}
     for source, report in reports.items():
         declared_root = report.get('root')
@@ -95,13 +98,24 @@ def validate(root, reports, docs):
                 errors.append(f'{ref}: 索引行数 {file["line_end"]} 与源码 {count} 不一致，请重建索引')
         except (OSError, ValueError) as exc:
             errors.append(f'{ref}: 索引文件无法读取: {exc}')
+    for file in files.values():
+        for config in file.get('resolution_configs', []):
+            try:
+                _, current_hash = read_source(config['path'])
+                if current_hash != config['content_hash']:
+                    errors.append(f'{config["path"]}: resolution config changed; rebuild JS/TS index')
+            except (OSError, ValueError, KeyError) as exc:
+                errors.append(f'resolution config unavailable: {exc}')
     for source, report in reports.items():
         if any(not f.get('content_hash') for f in report.get('files') or []):
             warnings.append(f'{source}: 旧索引缺少内容哈希，无法完整检查新鲜度')
 
     for md in docs:
-        text = without_fences((root / md).read_text(encoding='utf-8'))
-        for match in REF_PAT.finditer(text):
+        raw = (root / md).read_text(encoding='utf-8')
+        text = without_fences(raw)
+        import markdownlinks
+        links, visible = markdownlinks.analyze(raw)
+        for match in REF_PAT.finditer(visible):
             ref, start, end = match.group(1), int(match.group(2)), int(match.group(3) or match.group(2))
             checked += 1
             try:
@@ -110,8 +124,8 @@ def validate(root, reports, docs):
                     errors.append(f'{md}: {ref}:L{start}-L{end} 超出有效范围 1..{count}')
             except (OSError, ValueError) as exc:
                 errors.append(f'{md}: 引用文件无法读取 {ref}: {exc}')
-        for match in LINK_PAT.finditer(text):
-            label, link = match.groups()
+        for item in links:
+            label, link = item.label, item.target
             target = local_link_target(md, link)
             if target is None:
                 continue
@@ -161,12 +175,9 @@ def validate(root, reports, docs):
                         errors.append(f'{md}: {source} 的 {key} 文档值 {spec[key]} != 索引值 {stats.get(key)}')
             except (KeyError, ValueError, TypeError) as exc:
                 errors.append(f'{md}: agentsmd:stats 标记无效: {exc}')
-        headings = '\n'.join(re.findall(r'(?m)^#{1,6}\s+(.+)$', text))
-        required = (['模块地图', '架构与数据流', '构建/运行/测试'] if Path(md).name.lower() == 'agents.md'
-                    else ['功能点清单', '依赖与协作', '测试与验证'])
-        missing = [section for section in required if section not in headings]
-        if missing:
-            warnings.append(f'{md}: 缺少建议章节: {", ".join(missing)}')
+        from completeness import section_errors
+        is_root = md == root_document if root_document is not None else Path(md).name.lower() == 'agents.md'
+        warnings.extend(f'{md}: {message}' for message in section_errors(text, is_root))
     return list(dict.fromkeys(errors)), list(dict.fromkeys(warnings)), checked
 
 
@@ -178,40 +189,73 @@ def main():
     parser.add_argument('--evidence', help='evidence ledger; default discovered .agentsmd/evidence.json')
     parser.add_argument('--require-reviewed', action='store_true', help='require module review and behavioral evidence')
     parser.add_argument('--strict', action='store_true', help='所有警告也视为失败')
+    from diagnostics import add_arguments
+    add_arguments(parser)
+    parser.add_argument('--delivery', choices=['draft', 'sampled', 'complete'], default='draft')
     args = parser.parse_args()
+    args.require_reviewed = args.require_reviewed or args.delivery == 'complete'
+    from diagnostics import render
+    try:
+        errors, warnings, mapping, ledger, stats = run_checks(args)
+    except (OSError, ValueError, KeyError) as exc:
+        errors = getattr(exc, 'errors', [str(exc)])
+        warnings, mapping, ledger, stats = [], None, None, {}
+    failed = bool(errors or (args.strict and warnings))
+    if not args.json:
+        print(f'[verify] 索引 {stats.get("index_count", 0)} 份，文档 {stats.get("document_count", 0)} 个，引用检查 {stats.get("checked_references", 0)} 处')
+    result = render(errors, warnings, mapping, ledger, args, stats)
+    if not args.json:
+        print(f'[verify] {"FAILED" if failed else "OK"}: {result["error_count"]} 个错误，{result["warning_count"]} 个警告')
+    raise SystemExit(int(failed))
+
+
+def run_checks(args):
     root = Path(args.root).resolve()
-    paths = args.ast or [str(p) for p in (root / '.agentsmd/ast.json', root / '.agentsmd/index.json') if p.exists()]
+    from guidewrites import check_pending
+    check_pending(root)
+    from artifacts import read_json, load_reports
+    import snapshots
+    selected = snapshots.manifest(root / '.agentsmd')
+    pinned = {str((root / '.agentsmd').resolve()): selected}
+    paths = args.ast or snapshots.paths(root / '.agentsmd', ('ast.json', 'index.json'), selected)
     if not paths:
-        parser.error('未找到索引，请先运行 goast/codeindex.py')
+        raise ValueError('未找到索引，请先运行 goast/codeindex.py')
+    context_paths = snapshots.paths(root / '.agentsmd', ('context.json',), selected)
+    all_reports = load_reports(root, list(dict.fromkeys(map(str, list(paths) + context_paths))), pinned=pinned)
     reports = {}
-    for path in paths:
+    for path, report in zip(list(dict.fromkeys(map(str, list(paths) + context_paths))), all_reports):
         p = Path(path).resolve()
         name = p.relative_to(root).as_posix() if p.is_relative_to(root) else str(p)
-        reports[name] = json.loads(p.read_text(encoding='utf-8'))
-    from artifacts import read_json, load_reports
+        reports[name] = report
     module_path = Path(args.modules) if args.modules else root / '.agentsmd/modules.json'
     evidence_path = Path(args.evidence) if args.evidence else root / '.agentsmd/evidence.json'
     mapping = read_json(module_path) if module_path.exists() else None
-    if mapping:
+    ledger = read_json(evidence_path) if evidence_path.exists() else None
+    from schemas import require, mapping_errors, ledger_errors
+    if module_path.exists(): require(mapping_errors(mapping))
+    if evidence_path.exists(): require(ledger_errors(ledger))
+    if mapping is not None:
         # A reviewed map selects delivered guides; unrelated instruction/template files keep their role.
         docs = sorted({m['document'] for m in mapping['modules']})
     else:
         docs = iter_docs(root)
+    from guidepaths import validate_targets
+    validate_targets(root, docs)
     missing_docs = [md for md in docs if not root_path(root, md).is_file()]
     docs = [md for md in docs if md not in missing_docs]
     if not docs:
-        parser.error('未找到 AGENTS*.md 文档')
-    errors, warnings, checked = validate(root, reports, docs)
+        raise ValueError('未找到 AGENTS*.md 文档')
+    root_document = next((m['document'] for m in mapping['modules'] if m['id'] == mapping['root_module']), None) if mapping else None
+    errors, warnings, checked = validate(root, reports, docs, root_document)
     errors.extend(f'missing module document: {md}' for md in missing_docs)
     try:
-        if mapping:
+        if mapping is not None:
             import modules
-            all_reports = load_reports(root, paths + ([str(root / '.agentsmd/context.json')] if (root / '.agentsmd/context.json').exists() else []))
             errs, warns = modules.check(root, mapping, all_reports, require_reviewed=args.require_reviewed)
             errors.extend(errs); warnings.extend(warns)
             if evidence_path.exists():
                 import evidence
-                errs, warns = evidence.check(root, read_json(evidence_path), mapping, all_reports, args.require_reviewed)
+                errs, warns = evidence.check(root, ledger, mapping, all_reports, args.require_reviewed)
                 errors.extend(errs); warnings.extend(warns)
             elif args.require_reviewed:
                 errors.append('required evidence ledger missing')
@@ -219,24 +263,24 @@ def main():
             errors.append('module map missing; required for evidence/review checks')
         if args.evidence and not evidence_path.exists(): errors.append('specified evidence ledger missing')
         # Detect added/deleted/ignored sources as well as stale existing hashes.
+        if args.require_reviewed:
+            from schemas import reproducible_scope_errors
+            for name, report in reports.items():
+                errors.extend(reproducible_scope_errors(report.get('scope'), name + '.scope'))
         scoped = [report for report in reports.values() if report.get('scope', {}).get('selection_hash')]
         if scoped:
-            from scanpolicy import select_files
+            from scanpolicy import current_selection
+            seen_scopes = set()
             for report in scoped:
-                policy = report['scope']['policy']
-                current = select_files(root, policy['exclude'], policy['respect_gitignore'])
+                scope_key = json.dumps(report['scope'], sort_keys=True)
+                if scope_key in seen_scopes: continue
+                seen_scopes.add(scope_key)
+                current = current_selection(root, report['scope'])
                 if current['scope'] != report['scope']:
                     errors.append('analysis selection is stale; rerun analyze.py and reconcile modules')
     except (OSError, ValueError, KeyError) as exc:
         errors.append(str(exc))
-    print(f'[verify] 索引 {len(reports)} 份，文档 {len(docs)} 个，引用检查 {checked} 处')
-    for warning in warnings:
-        print('  WARN ' + warning)
-    for error in errors:
-        print('  ERR  ' + error)
-    failed = bool(errors or (args.strict and warnings))
-    print(f'[verify] {"FAILED" if failed else "OK"}: {len(errors)} 个错误，{len(warnings)} 个警告')
-    raise SystemExit(int(failed))
+    return errors, warnings, mapping, ledger, {'index_count': len(paths), 'document_count': len(docs), 'checked_references': checked}
 
 
 if __name__ == '__main__':

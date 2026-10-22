@@ -125,10 +125,10 @@ class ProjectCase(unittest.TestCase):
         self.write('src/a.go', 'package a\nfunc Run() {\n println(1)\n}\n// trailing comment\n')
         self.write('web/index.ts', 'const internal = 1;\nexport const run = () => internal;\n')
         self.write('config.yaml', 'port: 8080\n')
-        self.write('docs/AGENTS.api.md', '## 功能点清单\n[src/a.go:L3-L5](../src/a.go#L3-L5)\n'
-                   '[config.yaml:L1](../config.yaml#L1)\n## 依赖与协作\n## 测试与验证\n')
-        self.write('AGENTS.md', '## 模块地图\n[API](docs/AGENTS.api.md)\n## 架构与数据流\n'
-                   '## 构建/运行/测试\n[web/index.ts:L2](web/index.ts#L2)\n'
+        self.write('docs/AGENTS.api.md', '## 职责与目录\n介绍 Go 入口与配置。\n## 功能点清单\nRun 输出结果。\n[src/a.go:L3-L5](../src/a.go#L3-L5)\n'
+                   '[config.yaml:L1](../config.yaml#L1)\n## 依赖与协作\n本例无外部依赖。\n## 测试与验证\n本次仅核对静态引用，未执行目标测试。\n')
+        self.write('AGENTS.md', '## 项目定位\n演示多语言入口的引用检查。\n## 模块地图\n[API](docs/AGENTS.api.md)\n## 架构与数据流\nGo 与网页入口独立。\n'
+                   '## 构建/运行/测试\n使用对应语言工具；本次未运行目标。\n[web/index.ts:L2](web/index.ts#L2)\n'
                    '<!-- agentsmd:stats {"source":".agentsmd/ast.json","file_count":1} -->\n')
         reports = {'.agentsmd/ast.json': self.report([self.indexed('src/a.go')]),
                    '.agentsmd/index.json': self.report([self.indexed('web/index.ts')])}

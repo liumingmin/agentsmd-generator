@@ -188,3 +188,59 @@ func TestTestClassification(t *testing.T) {
 		t.Fatal("production helper classified as test")
 	}
 }
+
+func TestRepeatedSymbolIdentitySurvivesReordering(t *testing.T) {
+	parse := func(source string) []Symbol {
+		file, err := parser.ParseFile(token.NewFileSet(), "test.go", source, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var symbols []Symbol
+		for _, decl := range file.Decls {
+			fn := decl.(*ast.FuncDecl)
+			symbols = append(symbols, Symbol{Kind: "func", Name: fn.Name.Name, SignatureHash: fingerprint(fn.Type), ContentHash: fingerprint(fn)})
+		}
+		finalizeSymbols(symbols)
+		return symbols
+	}
+	before := parse("package demo\nfunc init(){ println(1) }\nfunc init(){ println(2) }\n")
+	after := parse("package demo\nfunc init(){ println(2) }\nfunc init(){ println(1) }\n")
+	if before[0].ID != after[1].ID || before[1].ID != after[0].ID {
+		t.Fatalf("declaration order changed identities: %+v => %+v", before, after)
+	}
+}
+
+func TestSelectionReadsGenerationReferenceAndRejectsTampering(t *testing.T) {
+	root := t.TempDir()
+	relative := "snapshots/one/selection.json"
+	data := []byte(`{"root":"fixture","files":[]}`)
+	path := filepath.Join(root, relative)
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	manifest, _ := json.Marshal(map[string]any{
+		"agentsmd_generation": true,
+		"artifacts":           map[string]string{"selection.json": relative},
+		"hashes":              map[string]string{"selection.json": fmt.Sprintf("%x", sha256.Sum256(data))},
+	})
+	if err := os.WriteFile(filepath.Join(root, "current.json"), manifest, 0644); err != nil {
+		t.Fatal(err)
+	}
+	ref := filepath.Join(root, "selection.json")
+	if err := os.WriteFile(ref, []byte(`{"agentsmd_snapshot_reference":"selection.json"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readSelection(ref)
+	if err != nil || string(got) != string(data) {
+		t.Fatalf("reference read: %s, %v", got, err)
+	}
+	if err := os.WriteFile(path, []byte(`{}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readSelection(ref); err == nil {
+		t.Fatal("tampered generation accepted")
+	}
+}

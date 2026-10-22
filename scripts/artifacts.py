@@ -4,7 +4,8 @@ from pathlib import Path
 
 
 def read_json(path):
-    return json.loads(Path(path).read_text(encoding='utf-8'))
+    from snapshots import read_report
+    return read_report(path)
 
 
 def write_json(path, value):
@@ -23,16 +24,39 @@ def safe_path(root, relative):
     return path
 
 
-def load_reports(root, paths=None):
+def load_reports(root, paths=None, pinned=None):
     root = Path(root).resolve()
-    paths = paths or [root / '.agentsmd' / name for name in ('context.json', 'ast.json', 'index.json')
-                      if (root / '.agentsmd' / name).is_file()]
-    reports = [read_json(path) for path in paths]
+    import snapshots
+    pinned = dict(pinned or {})
+    if not paths:
+        directory = root / '.agentsmd'
+        key = str(directory.resolve())
+        if key not in pinned:
+            pinned[key] = snapshots.manifest(directory)
+        paths = snapshots.paths(directory, pinned=pinned[key])
+    else:
+        paths = list(paths)
+    # Pin each manifest once even if publication happens between individual reads.
+    reports = []
+    for path in paths:
+        path = Path(path)
+        key = str(path.parent.resolve())
+        if key not in pinned:
+            pinned[key] = snapshots.manifest(path.parent)
+        report = snapshots.read_report(path, pinned[key])
+        from schemas import report_errors, require
+        require(report_errors(report, str(path)))
+        reports.append(report)
+    if any(value is None and snapshots.manifest(directory) is not None for directory, value in pinned.items()):
+        raise ValueError('analysis generation appeared while reading legacy reports; retry')
     if not reports:
         raise ValueError('no analysis reports found')
     for report in reports:
         if Path(report['root']).resolve() != root:
             raise ValueError('report root does not match project root')
+    generations = {r.get('snapshot_id') for r in reports}
+    if len(generations) > 1:
+        raise ValueError('reports belong to different analysis generations')
     scopes = [r.get('scope', {}).get('selection_hash') for r in reports]
     if len(set(scopes)) > 1:
         raise ValueError('reports use different selection scopes; rerun analyze.py')

@@ -9,6 +9,7 @@
 """
 import argparse
 import json
+from artifacts import read_json
 from scanpolicy import classify
 
 
@@ -22,7 +23,7 @@ def main():
     ap.add_argument("--category", choices=["all", "production", "test", "generated"], default="all")
     args = ap.parse_args()
 
-    ast = json.load(open(args.ast, encoding="utf-8"))
+    ast = read_json(args.ast)
 
     for category in ("production", "test", "generated"):
         if args.category not in ("all", category):

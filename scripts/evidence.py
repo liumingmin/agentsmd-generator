@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 from artifacts import read_json, write_json, safe_path, file_map, load_reports
 from scanpolicy import digest
+from citations import validate_citations
 
 BLOCK = re.compile(r'<!--\s*agentsmd:claim\s+([A-Za-z0-9_.:-]+)\s*-->(.*?)<!--\s*agentsmd:endclaim\s*-->', re.S)
 ROLES = {'entrypoint', 'implementation', 'caller', 'callee', 'configuration', 'interface', 'test'}
@@ -13,8 +14,12 @@ KINDS = {'behavior', 'flow', 'configuration', 'interface', 'test'}
 
 
 def blocks(root, document):
+    return parse_blocks(safe_path(root, document).read_text(encoding='utf-8'), document)
+
+
+def parse_blocks(text, document):
     from verify import without_fences
-    text = without_fences(safe_path(root, document).read_text(encoding='utf-8'))
+    text = without_fences(text)
     found = {}
     for match in BLOCK.finditer(text):
         cid, statement = match.groups()
@@ -50,6 +55,8 @@ def resolve_ref(root, ref, files):
 
 
 def capture(root, ledger, reports):
+    from schemas import ledger_errors, require
+    require(ledger_errors(ledger, draft=True))
     captured = copy.deepcopy(ledger)
     files = file_map(reports)
     cache = {}
@@ -68,12 +75,20 @@ def capture(root, ledger, reports):
 
 
 def check(root, ledger, mapping, reports, require_modules=False):
+    from schemas import mapping_errors, ledger_errors
+    errors, warnings, cache = mapping_errors(mapping) + ledger_errors(ledger), [], {}
+    if errors: return errors, warnings
     root = Path(root).resolve()
-    errors, warnings, cache = [], [], {}
     if Path(ledger.get('root', '')).resolve() != root:
         errors.append('evidence ledger root mismatch')
     modules = {m['id']: m for m in mapping['modules']}
     files = file_map(reports)
+    documents = {}
+    def document_blocks(document):
+        if document not in cache:
+            documents[document] = safe_path(root, document).read_text(encoding='utf-8')
+            cache[document] = parse_blocks(documents[document], document)
+        return cache[document]
     seen, covered, claim_documents = set(), set(), {}
     for claim in ledger.get('claims', []):
         cid = claim.get('id', '')
@@ -91,8 +106,12 @@ def check(root, ledger, mapping, reports, require_modules=False):
             errors.append(f'{cid}: inference/uncertainty needs a reason')
         try:
             document = claim['document']
-            if document not in cache: cache[document] = blocks(root, document)
-            statement = cache[document].get(cid)
+            statement = document_blocks(document).get(cid)
+            if statement and status == 'confirmed':
+                from completeness import unfinished
+                errors.extend(f'{cid}: {message}' for message in unfinished(statement))
+            if statement:
+                errors.extend(f'{cid}: {error}' for error in validate_citations(root, document, statement, claim.get('evidence', []), documents[document]))
             if not statement or claim.get('statement') != statement or claim.get('statement_hash') != digest(statement):
                 errors.append(f'{cid}: missing or changed Markdown claim; review then recapture')
             if status == 'inferred' and statement and not re.search(r'推断|推测|inferred', statement, re.I):
@@ -130,11 +149,38 @@ def check(root, ledger, mapping, reports, require_modules=False):
                         errors.append(f"{cid}: stale {key}: {ref['path']}; review evidence")
             except (OSError, ValueError, KeyError, TypeError) as exc:
                 errors.append(f'{cid}: {exc}')
+    by_claim = {c.get('id'): c for c in ledger.get('claims', [])}
     for module in modules.values():
+        review = module.get('review', {})
+        if require_modules or review.get('scope') == 'complete':
+            from reviewstate import freshness
+            errors.extend(freshness(root, module, files))
+            from modules import check_capabilities
+            if module.get('files'):
+                errors.extend(check_capabilities(module['id'], review.get('capabilities', [])))
+            for capability in review.get('capabilities', []):
+                cap_id = capability['id']
+                primary = capability.get('claims', [])
+                aspects = capability.get('aspects', {})
+                for aspect, item in aspects.items():
+                    if item.get('status') == 'covered':
+                        for claim_id in item.get('claims', []):
+                            claim = by_claim.get(claim_id, {})
+                            if claim.get('aspect') != aspect:
+                                errors.append(f'{module["id"]}/{cap_id}: {claim_id} does not prove aspect {aspect}')
+                            primary = primary + [claim_id]
+                primary_claims = [by_claim.get(cid, {}) for cid in capability.get('claims', [])]
+                if any(c.get('kind') in ('behavior', 'flow', 'test') for c in primary_claims) and aspects.get('success', {}).get('status') != 'covered':
+                    errors.append(f'{module["id"]}/{cap_id}: executable capability requires a covered success result')
+                for claim_id in set(primary):
+                    claim = by_claim.get(claim_id, {})
+                    if claim.get('module') != module['id'] or claim.get('capability') != cap_id or claim.get('status') != 'confirmed':
+                        errors.append(f'{module["id"]}/{cap_id}: missing/unconfirmed capability claim {claim_id}')
+                    if claim.get('aspect') == 'configuration' and claim.get('kind') != 'configuration':
+                        errors.append(f'{claim_id}: configuration aspect needs configuration source and implementation evidence')
         document = module['document']
         try:
-            if document not in cache: cache[document] = blocks(root, document)
-            for cid in cache[document]:
+            for cid in document_blocks(document):
                 if claim_documents.get(cid) != document: errors.append(f'{document}: claim {cid} missing from ledger or duplicated across documents')
         except (OSError, ValueError) as exc:
             errors.append(str(exc))
@@ -152,6 +198,8 @@ def main():
     ap.add_argument('--draft', help='capture input; default existing ledger')
     ap.add_argument('--report', action='append')
     ap.add_argument('--require-modules', action='store_true')
+    from diagnostics import add_arguments
+    add_arguments(ap)
     args = ap.parse_args()
     root = Path(args.root).resolve()
     ledger_path = Path(args.ledger) if args.ledger else root / '.agentsmd/evidence.json'
@@ -162,12 +210,14 @@ def main():
         if args.command == 'capture':
             ledger = capture(root, ledger, reports)
         errors, warnings = check(root, ledger, read_json(map_path), reports, args.require_modules)
-        for message in warnings: print('WARN ' + message)
-        for message in errors: print('ERR ' + message)
+        from diagnostics import render
+        render(errors, warnings, read_json(map_path), ledger, args)
         if errors: raise SystemExit(1)
         if args.command == 'capture': write_json(ledger_path, ledger)
-    except (OSError, ValueError, KeyError, TypeError) as exc:
-        ap.error(str(exc))
+    except (OSError, ValueError, KeyError) as exc:
+        from diagnostics import render
+        render(getattr(exc, 'errors', [str(exc)]), [], options=args)
+        raise SystemExit(1)
 
 
 if __name__ == '__main__':

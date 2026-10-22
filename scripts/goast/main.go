@@ -162,7 +162,7 @@ func main() {
 			Files []string        `json:"files"`
 			Scope json.RawMessage `json:"scope"`
 		}
-		data, readErr := os.ReadFile(*selectionPath)
+		data, readErr := readSelection(*selectionPath)
 		if readErr != nil {
 			fatal(readErr)
 		}
@@ -384,12 +384,7 @@ func main() {
 			}
 		}
 
-		ordinals := map[string]int{}
-		for i := range fi.Symbols {
-			key := fi.Symbols[i].Kind + ":" + fi.Symbols[i].Name
-			fi.Symbols[i].ID = fmt.Sprintf("%s#%d", key, ordinals[key])
-			ordinals[key]++
-		}
+		finalizeSymbols(fi.Symbols)
 		report.Files = append(report.Files, fi)
 		report.Stats.SymbolCount += len(fi.Symbols)
 
@@ -779,4 +774,100 @@ func localModulePaths(root string, packages []PkgInfo) map[string]string {
 		}
 	}
 	return result
+}
+
+// Prefer contracts/content over declaration order for repeated init and overloads.
+func finalizeSymbols(symbols []Symbol) {
+	groups := map[string][]int{}
+	for i, symbol := range symbols {
+		key := symbol.Kind + ":" + symbol.Name
+		groups[key] = append(groups[key], i)
+	}
+	for base, indexes := range groups {
+		signatures := map[string]int{}
+		for _, i := range indexes {
+			signatures[symbols[i].SignatureHash]++
+		}
+		used := map[string]int{}
+		for _, i := range indexes {
+			symbol := &symbols[i]
+			identity := base + "#0"
+			if len(indexes) > 1 {
+				if symbol.SignatureHash != "" && signatures[symbol.SignatureHash] == 1 {
+					identity = base + "@" + symbol.SignatureHash[:16]
+				} else {
+					identity = base + "@" + symbol.ContentHash[:16]
+				}
+			}
+			ordinal := used[identity]
+			used[identity]++
+			symbol.ID = identity
+			if ordinal > 0 {
+				symbol.ID += fmt.Sprintf("#%d", ordinal)
+			}
+		}
+	}
+}
+
+// Shared selection can be a standalone JSON or a logical generation reference.
+func readSelection(path string) ([]byte, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var reference struct {
+		Name string `json:"agentsmd_snapshot_reference"`
+	}
+	if err := json.Unmarshal(data, &reference); err != nil {
+		return nil, err
+	}
+	if reference.Name == "" {
+		return data, nil
+	}
+	if reference.Name != "selection.json" {
+		return nil, fmt.Errorf("expected a selection generation reference")
+	}
+	type generation struct {
+		Artifacts map[string]string `json:"artifacts"`
+		Hashes    map[string]string `json:"hashes"`
+	}
+	var current struct {
+		generation
+		Previous *generation `json:"previous"`
+		Managed  bool        `json:"agentsmd_generation"`
+	}
+	directory, err := filepath.Abs(filepath.Dir(path))
+	if err != nil {
+		return nil, err
+	}
+	manifest, err := os.ReadFile(filepath.Join(directory, "current.json"))
+	if err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(manifest, &current); err != nil {
+		return nil, err
+	}
+	if !current.Managed {
+		return nil, fmt.Errorf("invalid analysis generation manifest")
+	}
+	selected := &current.generation
+	if strings.HasSuffix(path, ".old.json") {
+		selected = current.Previous
+	}
+	if selected == nil || selected.Artifacts[reference.Name] == "" {
+		return nil, fmt.Errorf("selection not present in generation")
+	}
+	target := filepath.Join(directory, selected.Artifacts[reference.Name])
+	rel, err := filepath.Rel(filepath.Join(directory, "snapshots"), target)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return nil, fmt.Errorf("unsafe selection generation path")
+	}
+	data, err = os.ReadFile(target)
+	if err != nil {
+		return nil, err
+	}
+	if fmt.Sprintf("%x", sha256.Sum256(data)) != selected.Hashes[reference.Name] {
+		return nil, fmt.Errorf("selection generation checksum mismatch")
+	}
+	return data, nil
 }
