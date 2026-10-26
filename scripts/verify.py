@@ -63,7 +63,7 @@ def local_link_target(md, link):
     return Path(md).parent / unquote(parsed.path)
 
 
-def validate(root, reports, docs, root_document=None):
+def validate(root, reports, docs, root_document=None, texts=None):
     from schemas import report_errors
     errors = [error for source, report in reports.items() for error in report_errors(report, source)]
     warnings, checked = [], 0
@@ -111,7 +111,7 @@ def validate(root, reports, docs, root_document=None):
             warnings.append(f'{source}: 旧索引缺少内容哈希，无法完整检查新鲜度')
 
     for md in docs:
-        raw = (root / md).read_text(encoding='utf-8')
+        raw = texts[md] if texts is not None and md in texts else (root / md).read_text(encoding='utf-8')
         text = without_fences(raw)
         import markdownlinks
         links, visible = markdownlinks.analyze(raw)
@@ -130,8 +130,13 @@ def validate(root, reports, docs, root_document=None):
             if target is None:
                 continue
             checked += 1
-            path = root / target
-            if not path.exists():
+            path = (root / target).resolve()
+            if not path.is_relative_to(root):
+                errors.append(f'{md}: link outside project: {link}')
+                continue
+            relative = path.relative_to(root).as_posix()
+            planned = texts is not None and relative in texts
+            if not planned and not path.exists():
                 errors.append(f'{md}: 死链 -> {link}')
                 continue
             ref_match = re.fullmatch(r'(.+):L(\d+)(?:-L(\d+))?', label)
@@ -150,7 +155,7 @@ def validate(root, reports, docs, root_document=None):
             elif re.fullmatch(r'L\d+(?:-L\d+)?', fragment):
                 nums = [int(n) for n in re.findall(r'\d+', fragment)]
                 try:
-                    count = len(path.read_bytes().splitlines())
+                    count = len(texts[relative].splitlines()) if planned else len(path.read_bytes().splitlines())
                     if not 1 <= nums[0] <= nums[-1] <= count:
                         errors.append(f'{md}: 链接锚点超出源码行数: {link}')
                 except OSError as exc:
@@ -191,7 +196,8 @@ def main():
     parser.add_argument('--strict', action='store_true', help='所有警告也视为失败')
     from diagnostics import add_arguments
     add_arguments(parser)
-    parser.add_argument('--delivery', choices=['draft', 'sampled', 'complete'], default='draft')
+    parser.add_argument('--delivery', choices=['draft', 'sampled', 'complete'],
+                        help='delivery mode; default from module map, otherwise draft')
     args = parser.parse_args()
     args.require_reviewed = args.require_reviewed or args.delivery == 'complete'
     from diagnostics import render
@@ -213,7 +219,7 @@ def run_checks(args):
     root = Path(args.root).resolve()
     from guidewrites import check_pending
     check_pending(root)
-    from artifacts import read_json, load_reports
+    from artifacts import read_json, load_reports, ledger_path
     import snapshots
     selected = snapshots.manifest(root / '.agentsmd')
     pinned = {str((root / '.agentsmd').resolve()): selected}
@@ -228,12 +234,19 @@ def run_checks(args):
         name = p.relative_to(root).as_posix() if p.is_relative_to(root) else str(p)
         reports[name] = report
     module_path = Path(args.modules) if args.modules else root / '.agentsmd/modules.json'
-    evidence_path = Path(args.evidence) if args.evidence else root / '.agentsmd/evidence.json'
     mapping = read_json(module_path) if module_path.exists() else None
-    ledger = read_json(evidence_path) if evidence_path.exists() else None
     from schemas import require, mapping_errors, ledger_errors
     if module_path.exists(): require(mapping_errors(mapping))
+    evidence_path = ledger_path(root, mapping, args.evidence)
+    ledger = read_json(evidence_path) if evidence_path.exists() else None
     if evidence_path.exists(): require(ledger_errors(ledger))
+    declared_mode = (mapping or {}).get('delivery', {}).get('mode', 'draft')
+    requested_mode = 'complete' if args.require_reviewed else args.delivery
+    mode_errors = []
+    if requested_mode is not None and mapping is not None and declared_mode != requested_mode:
+        mode_errors.append(f'delivery mode mismatch: requested {requested_mode}, module map declares {declared_mode}; reconcile the map instead of downgrading checks')
+    # A complete declaration always gets the complete gate, even with a weaker flag.
+    args.require_reviewed = args.require_reviewed or declared_mode == 'complete'
     if mapping is not None:
         # A reviewed map selects delivered guides; unrelated instruction/template files keep their role.
         docs = sorted({m['document'] for m in mapping['modules']})
@@ -247,6 +260,7 @@ def run_checks(args):
         raise ValueError('未找到 AGENTS*.md 文档')
     root_document = next((m['document'] for m in mapping['modules'] if m['id'] == mapping['root_module']), None) if mapping else None
     errors, warnings, checked = validate(root, reports, docs, root_document)
+    errors.extend(mode_errors)
     errors.extend(f'missing module document: {md}' for md in missing_docs)
     try:
         if mapping is not None:

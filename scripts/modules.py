@@ -195,6 +195,13 @@ def check(root, mapping, reports, documents=True, require_reviewed=False):
                     content = safe_path(root, module['document']).read_text(encoding='utf-8')
                     errors.extend(f'{mid}: {message}' for message in unfinished(content))
                     errors.extend(f'{mid}: {message}' for message in section_errors(content, mid == root_id))
+                    # A prior sampled navigation block is generated status, not
+                    # authored behavior. Updating JSON alone must not conceal it.
+                    from markdownlinks import active_mask
+                    visible = active_mask(content, keep_comments=True)
+                    navigation = re.search(r'<!-- agentsmd:draft-navigation -->(.*?)<!-- agentsmd:enddraft-navigation -->', visible, re.S)
+                    if scope == 'complete' and navigation and '抽样审阅，未完成整个模块。' in navigation[1]:
+                        errors.append(f'{mid}: generated review status is stale; rerun draft.py with the current module map')
                 links = linked_documents(root, module['document'])
                 required = module.get('children', []) + ([parent] if parent in by_id else [])
                 for other in required:

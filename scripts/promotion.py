@@ -1,7 +1,7 @@
 """Publish preview text and evidence together, without refreshing source proofs."""
 import copy
 from pathlib import Path
-from artifacts import file_map, safe_path
+from artifacts import file_map, safe_path, report_items
 from citations import validate_citations
 from draft import relocate_links
 from guidepaths import contained_path, preview_directory, validate_targets
@@ -9,12 +9,17 @@ from guidewrites import apply, check_pending, json_bytes
 import evidence
 import modules
 from scanpolicy import current_selection, digest
-from schemas import mapping_errors, ledger_errors, require
+from schemas import mapping_errors, ledger_errors, reproducible_scope_errors, require
 
 
-def promote(root, mapping, ledger, reports, inputs=None, after_replace=None):
+def promote(root, mapping, ledger, reports, inputs=None, after_replace=None, delivery='complete'):
     root = Path(root).resolve()
     require(mapping_errors(mapping) + ledger_errors(ledger))
+    if delivery not in ('complete', 'sampled'):
+        raise ValueError('promotion delivery must be complete or explicitly sampled')
+    if mapping.get('delivery', {}).get('mode') != delivery:
+        raise ValueError(f'promotion requires delivery.mode={delivery}; finish module reading and evidence for complete delivery; '
+                         'use --delivery sampled only for an explicitly requested partial delivery')
     check_pending(root)
     if Path(mapping['root']).resolve() != root: raise ValueError('module map root mismatch')
     if mapping.get('delivery', {}).get('scope_confirmed') is not True:
@@ -36,9 +41,21 @@ def promote(root, mapping, ledger, reports, inputs=None, after_replace=None):
         if file.get('content_hash') and digest(safe_path(root, path).read_bytes()) != file['content_hash']:
             raise ValueError(f'{path}: source index stale; reanalyze before promotion')
     # Check captured prose/citations/live source before changing any link or hash.
-    errors, _ = modules.check(root, mapping, reports)
-    errs, _ = evidence.check(root, ledger, mapping, reports)
-    require(errors + errs)
+    complete = delivery == 'complete'
+    errors, _ = modules.check(root, mapping, reports, require_reviewed=complete)
+    errs, _ = evidence.check(root, ledger, mapping, reports, require_modules=complete)
+    errors.extend(errs)
+    if complete:
+        for i, report in enumerate(reports):
+            errors.extend(reproducible_scope_errors(report.get('scope'), f'reports[{i}].scope'))
+    require(errors)
+    from verify import validate
+    named_reports = report_items(root, reports)
+    root_document = next(m['document'] for m in mapping['modules'] if m['id'] == mapping['root_module'])
+    errs, _, _ = validate(root, named_reports, list(source_bytes), root_document,
+                          {path: raw.decode('utf-8') for path, raw in source_bytes.items()})
+    errors.extend(errs)
+    require(errors)
     source_to_final = {m['document']: m['final_document'] for m in mapping['modules']}
     output, captured = copy.deepcopy(mapping), copy.deepcopy(ledger)
     baseline = {m['final_document']: m['final_document_hash'] for m in mapping['modules']}
@@ -64,6 +81,12 @@ def promote(root, mapping, ledger, reports, inputs=None, after_replace=None):
         require(validate_citations(root, final, statement, claim['evidence'], writes[final].decode('utf-8')))
         claim['document'], claim['statement'], claim['statement_hash'] = final, statement, digest(statement)
         # Source/snippet/symbol hashes, claim status and review/test records stay intact.
+    # Verify the relocated documents before writing. Links to planned guides are
+    # checked against this batch, so new final targets need not exist yet.
+    final_texts = {path: raw.decode('utf-8') for path, raw in writes.items()}
+    final_root = source_to_final[root_document]
+    errors, _, _ = validate(root, named_reports, list(final_texts), final_root, final_texts)
+    require(errors)
     writes['.agentsmd/modules.json'] = json_bytes(output)
     writes['.agentsmd/evidence.json'] = json_bytes(captured)
     originals = {}

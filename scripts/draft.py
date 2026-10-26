@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import re
 from urllib.parse import quote, unquote, urlsplit
-from artifacts import load_reports, file_map, read_json, write_json, safe_path
+from artifacts import load_reports, file_map, read_json, write_json, safe_path, ledger_path as paired_ledger
 from citations import citation
 from modules import ASPECTS
 from guidepaths import validate_targets, preview_directory, contained_path, guide_path
@@ -127,7 +127,7 @@ def generate(root, mapping, reports, ledger=None, write=False, out_dir=None, new
         note = '抽样审阅，未完成整个模块。' if scope == 'sampled' else ('已登记完整审阅范围；仍须运行交付校验。' if scope == 'complete' else '待核实：尚未完成实现阅读。')
         if not module.get('files'):
             note = '本节点不直接归属源码；实现阅读范围见子模块。'
-        heading = '模块地图' if mid == output.get('root_module') else '功能点清单'
+        heading = '模块地图' if mid == output.get('root_module') else '审阅状态与源码统计'
         content = f'## {heading}\n\n{note}\n\n' + ('\n'.join(links) or '无父子模块导航。')
         content += '\n\n| 源码类别（仅直接归属） | 文件 | 索引符号 |\n| --- | --- | --- |\n' + rows
         text = replace_managed(text, 'draft-navigation', content)
@@ -138,7 +138,7 @@ def generate(root, mapping, reports, ledger=None, write=False, out_dir=None, new
                      ('构建/运行/测试', 'commands', '待核实：记录命令来源、前提及真实执行状态。')]
                     if mid == output.get('root_module') else
                     [('职责与目录', 'responsibility', '待核实：根据归属实现说明职责与边界。'),
-                     ('主要功能', 'behavior', '待核实：根据具体能力说明触发、处理和结果。'),
+                     ('功能点清单', 'behavior', '待核实：根据具体能力说明触发、处理和结果。'),
                      ('依赖与协作', 'collaboration', '待核实：阅读双方调用位置后补充。'),
                      ('测试与验证', 'tests', str(review.get('test', {}).get('status', 'not_reviewed')) + '；' + str(review.get('test', {}).get('reason', '尚未审阅')))])
         for title, key, prompt in sections:
@@ -205,12 +205,16 @@ def main():
     ap.add_argument('--ledger')
     ap.add_argument('--report', action='append')
     ap.add_argument('--out-dir', help='preview session directory; default from preview map or .agentsmd/drafts')
+    ap.add_argument('--delivery', choices=['complete', 'sampled'],
+                    help='promotion delivery mode (default complete); sampled requires an explicit partial-delivery request')
     action = ap.add_mutually_exclusive_group()
     action.add_argument('--write', action='store_true', help='update managed blocks at final module document paths')
     action.add_argument('--recover', action='store_true', help='roll back an interrupted guide batch; never overwrite conflicting user edits')
     action.add_argument('--promote', action='store_true', help='publish reviewed preview documents and their map/ledger to final targets')
     action.add_argument('--new-preview', action='store_true', help='create a new session from the final map in an empty --out-dir')
     args = ap.parse_args()
+    if args.delivery and not args.promote:
+        ap.error('--delivery applies only to --promote; draft generation does not change review scope')
     root = Path(args.root).resolve()
     try:
         if args.recover:
@@ -220,9 +224,13 @@ def main():
         if args.promote:
             from promotion import promote
             map_path = Path(args.mapping) if args.mapping else root / '.agentsmd/drafts/modules.draft.json'
-            ledger_path = Path(args.ledger) if args.ledger else root / '.agentsmd/drafts/evidence.draft.json'
-            inputs = {path: path.read_bytes() for path in (map_path, ledger_path)}
-            final, ledger = promote(root, read_json(map_path), read_json(ledger_path), load_reports(root, args.report), inputs)
+            inputs = {map_path: map_path.read_bytes()}
+            mapping = read_json(map_path)
+            require(mapping_errors(mapping))
+            ledger_path = paired_ledger(root, mapping, args.ledger)
+            inputs[ledger_path] = ledger_path.read_bytes()
+            final, ledger = promote(root, mapping, read_json(ledger_path), load_reports(root, args.report), inputs,
+                                    delivery=args.delivery or 'complete')
             print(f'Promoted {len(final["modules"])} guides and {len(ledger["claims"])} evidence records; review/test/claim statuses unchanged')
             return
         map_path = Path(args.mapping) if args.mapping else root / '.agentsmd/modules.json'
@@ -230,9 +238,7 @@ def main():
         mapping = read_json(map_path)
         require(mapping_errors(mapping))
         out_dir = args.out_dir or mapping.get('preview', {}).get('directory', '.agentsmd/drafts')
-        ledger_path = Path(args.ledger) if args.ledger else root / '.agentsmd/evidence.json'
-        if not args.ledger and 'preview' in mapping:
-            ledger_path = root / mapping['preview']['directory'] / 'evidence.draft.json'
+        ledger_path = paired_ledger(root, mapping, args.ledger)
         if args.ledger and not args.write and not args.new_preview and 'preview' not in mapping and (root / out_dir / 'modules.draft.json').exists():
             raise ValueError('existing preview owns its ledger; use --map <preview map> when supplying an explicit --ledger')
         if ledger_path.exists(): inputs[ledger_path] = ledger_path.read_bytes()

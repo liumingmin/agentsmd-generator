@@ -4,7 +4,7 @@ import argparse
 import copy
 import re
 from pathlib import Path
-from artifacts import read_json, write_json, safe_path, file_map, load_reports
+from artifacts import read_json, write_json, safe_path, file_map, load_reports, ledger_path as paired_ledger
 from scanpolicy import digest
 from citations import validate_citations
 
@@ -202,16 +202,19 @@ def main():
     add_arguments(ap)
     args = ap.parse_args()
     root = Path(args.root).resolve()
-    ledger_path = Path(args.ledger) if args.ledger else root / '.agentsmd/evidence.json'
     map_path = Path(args.mapping) if args.mapping else root / '.agentsmd/modules.json'
     try:
         reports = load_reports(root, args.report)
+        mapping = read_json(map_path)
+        from schemas import mapping_errors, require
+        require(mapping_errors(mapping))
+        ledger_path = paired_ledger(root, mapping, args.ledger)
         ledger = read_json(args.draft or ledger_path)
         if args.command == 'capture':
             ledger = capture(root, ledger, reports)
-        errors, warnings = check(root, ledger, read_json(map_path), reports, args.require_modules)
+        errors, warnings = check(root, ledger, mapping, reports, args.require_modules)
         from diagnostics import render
-        render(errors, warnings, read_json(map_path), ledger, args)
+        render(errors, warnings, mapping, ledger, args)
         if errors: raise SystemExit(1)
         if args.command == 'capture': write_json(ledger_path, ledger)
     except (OSError, ValueError, KeyError) as exc:

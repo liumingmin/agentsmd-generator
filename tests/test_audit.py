@@ -33,6 +33,7 @@ class Audit(unittest.TestCase):
         self.assertEqual(helper.cli(case, 'verify.py', '--delivery', 'complete', '--strict', '--json').returncode, 0)
         for report in reports: report.pop('scope', None)
         mapping.pop('scope', None)
+        mapping['delivery']['mode'] = 'draft'
         helper.save(case, reports, mapping, ledger)
         # Legacy indexes remain readable, but cannot establish file coverage.
         self.assertEqual(helper.cli(case, 'verify.py', '--json').returncode, 0)

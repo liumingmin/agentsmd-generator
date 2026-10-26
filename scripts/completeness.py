@@ -23,6 +23,31 @@ SECTIONS = {
 }
 
 
+def authored_lines(text):
+    """Keep prose and authored table bodies; discard headers and count-only rows."""
+    lines, output, table = text.splitlines(), [], False
+    def cells(line):
+        return [part.strip() for part in re.split(r'(?<!\\)\|', line.strip().strip('|'))]
+    def separator(line):
+        return '|' in line and all(re.fullmatch(r':?-{3,}:?', part) for part in cells(line))
+    for i, line in enumerate(lines):
+        if i + 1 < len(lines) and '|' in line and separator(lines[i + 1]):
+            table = True
+            continue
+        if separator(line): continue
+        if '|' not in line:
+            table = False
+            output.append(line)
+            continue
+        if not table: continue  # An isolated table-like header is not a body.
+        values = [part for part in cells(line) if part]
+        if not values: continue
+        if all(value.casefold() in ('todo', '待补充', '待核实', 'unknown', 'n/a', 'na', '-') for value in values): continue
+        if all(re.fullmatch(r'[\d\s.,%+\-]+', value) for value in values[1:] or values): continue
+        output.extend(values)
+    return '\n'.join(output)
+
+
 def has_section(text, key):
     text = re.sub(r'<!-- agentsmd:draft-navigation -->.*?<!-- agentsmd:enddraft-navigation -->', '', text, flags=re.S)
     text = active_mask(text, keep_comments=True)
@@ -61,7 +86,7 @@ def section_errors(text, root=False):
         declared.update(key for key, aliases in SECTIONS.items() if title in aliases)
         parents.append((level, declared))
         declared = set().union(*(sections for _, sections in parents))
-        prose = '\n'.join(line for line in prose.splitlines() if not line.lstrip().startswith('|'))
+        prose = authored_lines(prose)
         prose = re.sub(r'[\s#*>_`~\-:：;；.。]+', '', prose)
         if prose and prose.casefold() not in ('todo', '待补充', '待核实', 'unknown', 'n/a', 'na') and not unfinished(body):
             covered.update(declared)

@@ -3,6 +3,26 @@ import json
 from pathlib import Path
 
 
+class Report(dict):
+    """Report data with its input path kept out of serialized analysis content."""
+
+
+def report_items(root, reports):
+    root, named = Path(root).resolve(), {}
+    for report in reports:
+        source = getattr(report, 'source', None)
+        if source is None:
+            # Direct scan() callers use the standard logical report locations.
+            name = 'context' if 'categories' in report else ('index' if 'notices' in report else 'ast')
+            source = root / '.agentsmd' / (name + '.json')
+        path = Path(source).resolve()
+        name = path.relative_to(root).as_posix() if path.is_relative_to(root) else str(path)
+        if name in named:
+            raise ValueError(f'duplicate analysis report input: {name}')
+        named[name] = report
+    return named
+
+
 def read_json(path):
     from snapshots import read_report
     return read_report(path)
@@ -12,6 +32,16 @@ def write_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+
+
+def ledger_path(root, mapping, explicit=None):
+    """Keep a selected preview paired with its own evidence by default."""
+    if explicit is not None: return Path(explicit)
+    if mapping is not None and 'preview' in mapping:
+        from guidepaths import preview_directory, contained_path
+        directory = preview_directory(root, mapping['preview']['directory'])
+        return contained_path(root, (directory / 'evidence.draft.json').relative_to(Path(root).resolve()).as_posix())
+    return Path(root) / '.agentsmd/evidence.json'
 
 
 def safe_path(root, relative):
@@ -46,6 +76,8 @@ def load_reports(root, paths=None, pinned=None):
         report = snapshots.read_report(path, pinned[key])
         from schemas import report_errors, require
         require(report_errors(report, str(path)))
+        report = Report(report)
+        report.source = path.resolve()
         reports.append(report)
     if any(value is None and snapshots.manifest(directory) is not None for directory, value in pinned.items()):
         raise ValueError('analysis generation appeared while reading legacy reports; retry')

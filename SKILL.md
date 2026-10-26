@@ -7,6 +7,12 @@ description: 分析仓库源码、测试和配置，生成或更新带源码证�
 
 根 `AGENTS.md` 提供项目地图和修改入口，模块文档解释行为、接口与协作。说明应回答“什么输入触发什么处理、有哪些限制、如何验证”，并能回溯到当前源码；不将符号清单直接改写成功能保证。
 
+## 默认交付目标
+
+用户要求生成/完善项目或模块说明时，默认完成约定范围内所有模块的源码阅读与功能梳理，最终使用 complete 交付检查。仅当用户明确要求抽样、快速概览或部分交付时，才以 sampled 作为交付目标。大项目可分批阅读并持久化进度，批次是过程状态；继续处理剩余文件和模块，不能以规模大、候选已有三个位置或草稿校验通过为由结束任务。
+
+如果确有文件不可读、缺少必要输入等阻碍，如实说明具体范围和原因，保留未完成状态。不能只删除“抽样审阅”字样、将 scope 改为 complete 或刷新哈希来宣称完成。
+
 ## 1. 统一范围，提取索引
 
 读取目标仓库已有 `AGENTS.md` 和目录级指令。保留人工维护的约定与无关内容；已有管理标记时只更新对应区块。不将本技能自身当作待分析项目。
@@ -52,7 +58,7 @@ python3 <skill_dir>/scripts/draft.py --root <项目根>
 # 预览位于 .agentsmd/drafts/，modules.draft.json 与 evidence.draft.json 配套使用
 # 默认继续已有会话；需要新基线时，从最终地图在空目录新建
 python3 <skill_dir>/scripts/draft.py --root <项目根> --new-preview --out-dir .agentsmd/drafts/next-review
-# --write 仅用于最终地图，更新最终文档管理区；预览转正使用下列 --promote
+# --write 仅用于最终地图，更新最终文档管理区；预览转正见第 6 节
 ```
 
 生成前检查全部目标：只允许地图声明的 `AGENTS.md` / `AGENTS.<模块>.md`，拒绝源码/其他文档、路径别名或重复目标、符号链接及共享硬链接；预览只写 `.agentsmd/drafts/`。语义章节只初始化一次，后续重跑只更新导航和统计，保留已编写内容。
@@ -63,29 +69,24 @@ python3 <skill_dir>/scripts/draft.py --root <项目根> --new-preview --out-dir 
 
 候选位置排除注释和字面量内容，再按输入、成功、失败、配置方面分别匹配；仍需核对实际分支。JS/TS 必须有有效 TypeScript AST 保存的排除范围，涵盖注释、字符串、正则、整个模板及 JSX（含内部插值与处理器）；缺少该元数据的旧索引需重建。不支持的语言或无法可靠分词时不给候选，未匹配时明确缺少候选，不用首段源码填充。批量生成会保存暂存内容和恢复日志；普通失败回滚，中断后先运行 `draft.py --root <项目根> --recover`。恢复遇到用户后续编辑会报告冲突，不覆盖该编辑；恢复完成前禁止继续生成或交付。
 
-预览记录最终文档路径及原目标指纹。完善预览后，使用预览地图和预览 ledger 捕获证据、核验，再转正：
-
-```bash
-python3 <skill_dir>/scripts/evidence.py capture --root <项目根> --map <项目根>/.agentsmd/drafts/modules.draft.json --ledger <项目根>/.agentsmd/drafts/evidence.draft.json
-python3 <skill_dir>/scripts/draft.py --root <项目根> --promote
-```
-
-转正将人工预览正文、最终 modules.json 和 evidence.json 一起写入，重定位文档间导航与源码链接；目标在预览生成后有其他编辑时拒绝覆盖。必须先捕获并核对预览证据；转正只更新路径重写引起的文案哈希，不刷新源码指纹、不提升审阅/测试/结论状态。转正后仍运行对应交付模式的 verify；详细流程和自定义预览路径见分析产物参考。
+预览记录最终文档路径及原目标指纹。生成后，本次阅读、能力、测试与证据记录统一维护在预览的 modules.draft.json / evidence.draft.json；后续命令显式传入预览地图。修改最终 modules.json 不会更新已有预览，默认重跑会继续原预览状态。显式选择预览地图时，生成、证据捕获、校验和转正默认使用该地图所在会话的 evidence.draft.json；显式覆盖 ledger 时仍须与地图一致。完成阅读后按第 6 节校验、转正。
 
 链接迁移只修改实际目标位置，保留标签、标题及代码示例；普通链接、图片和引用式链接使用同一读取逻辑。claim 的引用定义可以放在文档其他位置，但目标和行号仍须与 ledger 对应。校验、导航和增量复核也解析这些引用，不能用行内代码中的链接示例充当源码证据。
 
-区分三种覆盖：**源码归属、实现阅读、实际测试执行**。模块地图初始 `review.scope` 为 unreviewed。抽样时用 sampled 并在可见文案中说明；完整时用 complete，并在 `reviewed_files` / `exclusions` 中逐一交代所有归属文件，排除项必须有原因，入口/核心实现必须在实际阅读列表内。为每个有直接源码的模块记录读过的公共入口/声明与核心实现文件，并记录测试是未审阅、未运行、通过、失败、未发现还是不适用及原因。纯数据/接口模块以对外声明作为入口；无运行流程时说明这一点。
+## 3. 逐模块完成阅读
 
-用资产清单查找 README/设计、配置、测试、CI、Dockerfile、迁移和 proto。围绕每项主要能力追踪：**入口/调用方 → 校验与分支 → 核心处理 → 存储/外部调用 → 结果或错误**。查找真实调用点确认反向协作；只有 import 依据时称“导入依赖”。大项目可以分批交付，但必须列出未阅读模块，不能用文件归属率替代功能理解程度。按模块登记主要能力清单 `review.capabilities`，每项记录 input、success、failure、configuration 四方面的结论 ID。covered 项引用已确认且属于该能力/方面的 claim；不适用项填写 not_applicable 及原因，未确认项不能用于完整交付。纯声明模块无需编造运行流程，但仍要解释哪些方面不适用。阅读记录使用 `source_hashes` 绑定模块全部归属源码（包括排除文件）的当前内容。完成实际阅读/复核后，显式记录指定模块：
+区分三种覆盖：**源码归属、实现阅读、实际测试执行**。模块地图初始 `review.scope` 为 unreviewed。阅读过程尚未完成时保留 unreviewed/sampled；达到完整要求后用 complete，并在 `reviewed_files` / `exclusions` 中逐一交代所有归属文件，排除项必须有原因，入口/核心实现必须在实际阅读列表内。为每个有直接源码的模块记录读过的公共入口/声明与核心实现文件，并记录测试是未审阅、未运行、通过、失败、未发现还是不适用及原因。纯数据/接口模块以对外声明作为入口；无运行流程时说明这一点。
+
+用资产清单查找 README/设计、配置、测试、CI、Dockerfile、迁移和 proto。围绕每项主要能力追踪：**入口/调用方 → 校验与分支 → 核心处理 → 存储/外部调用 → 结果或错误**。查找真实调用点确认反向协作；只有 import 依据时称“导入依赖”。以模块 files 为待办清单，逐文件阅读公共入口、内部实现与辅助逻辑，核对相关配置和测试断言，再归纳实际能力；不能只阅读自动候选或首个入口。将已读文件、尚未解决的能力方面及剩余模块写入当前预览地图，继续下一批。exclusions 只用于有明确理由的非阅读对象，不能因文件多、时间不足而排除未读业务实现。不能用文件归属率替代功能理解程度。按模块登记主要能力清单 `review.capabilities`，每项记录 input、success、failure、configuration 四方面的结论 ID。covered 项引用已确认且属于该能力/方面的 claim；不适用项填写 not_applicable 及原因，未确认项不能用于完整交付。纯声明模块无需编造运行流程，但仍要解释哪些方面不适用。阅读记录使用 `source_hashes` 绑定模块全部归属源码（包括排除文件）的当前内容。完成实际阅读/复核后，显式记录指定模块：
 
 ```bash
-python3 <skill_dir>/scripts/modules.py record-review --root <项目根> --module <模块ID>
+python3 <skill_dir>/scripts/modules.py record-review --root <项目根> --map <项目根>/.agentsmd/drafts/modules.draft.json --module <模块ID>
 # 多个已复核模块可重复 --module；不自动提升 scope、结论确认状态或测试结果
 ```
 
 新增函数、源码内容或归属变化都会使旧阅读记录失效；重新分析、生成草稿、capture 证据均不会刷新它。先复核变更、能力清单和说明，再 record-review。旧地图缺少哈希时必须补录，不能直接沿用 complete。完整字段示例见分析产物参考。
 
-测试通过/失败记录还须绑定执行时的源码、测试、配置及依赖清单指纹。确需运行且命令在授权范围内时，可用 `teststate.py --root <项目根> --module <模块ID> --cwd <项目内目录> -- <命令及参数>` 实际执行并登记；不通过重建索引或 record-review 刷新测试记录。旧记录或输入变化后的结果仅作历史结果，当前版本可如实记录 not_run 及原因；不为生成文档自动运行集成测试。
+测试通过/失败记录还须绑定执行时的源码、测试、配置及依赖清单指纹。确需运行且命令在授权范围内时，可用 `teststate.py --root <项目根> --map <项目根>/.agentsmd/drafts/modules.draft.json --module <模块ID> --cwd <项目内目录> -- <命令及参数>` 实际执行并登记；不通过重建索引或 record-review 刷新测试记录。旧记录或输入变化后的结果仅作历史结果，当前版本可如实记录 not_run 及原因；不为生成文档自动运行集成测试。
 
 ```bash
 python3 <skill_dir>/scripts/hotspots.py --ast <项目根>/.agentsmd/ast.json
@@ -94,9 +95,9 @@ python3 <skill_dir>/scripts/callgraph.py --ast <项目根>/.agentsmd/ast.json --
 
 热点分别报告 production/test/generated，不把生成分发器或测试辅助函数当作生产业务热点。规模只提示阅读优先级，不证明性能瓶颈。Go 导入图支持嵌套 module；增量影响还解析 JS/TS 相对 import/reexport 和基础 Python import，JS/TS 别名依据编译器配置解析，不猜测运行时调用。
 
-## 3. 编写模块文档，绑定证据
+## 4. 编写模块文档，绑定证据
 
-读取 [模块文档模板](references/module-doc-template.md)。模块必须交代职责与目录、功能点、入口与调用流程、依赖协作、测试与验证。主要功能写清触发/输入、关键处理、输出/副作用、重要失败与边界条件，并分别引用对应实现。按实际需要补充配置默认值/优先级、外部资源、数据模型、错误、事务/幂等、并发与生命周期；无证据时标注未知或不适用，不用空表填充。
+读取 [模块文档模板](references/module-doc-template.md)。模块必须交代职责与目录、功能点、入口与调用流程、依赖协作、测试与验证。“功能点清单”应覆盖该模块实际主要能力；审阅状态、源码统计和候选位置单独列出，不能代替功能说明。主要功能写清触发/输入、关键处理、输出/副作用、重要失败与边界条件，并分别引用对应实现。按实际需要补充配置默认值/优先级、外部资源、数据模型、错误、事务/幂等、并发与生命周期；无证据时标注未知或不适用，不用空表填充。
 
 **每条源码证据必须包含路径和行号。** 文档中的可见引用使用项目根相对路径和真实行号，例如 `[src/service.go:L20-L42](src/service.go#L20-L42)`；涉及多行时标注起止行，Markdown 链接目标相对文档所在目录。结构化证据必须记录 `path` 和 `line`，多行证据同时记录 `end_line`。每个 claim 区块内的可见证据链接必须与清单中的文件和范围逐一对应，并带正确行号锚点；仅在 JSON 中保存行号不能替代正文引用。
 
@@ -107,7 +108,7 @@ python3 <skill_dir>/scripts/callgraph.py --ast <项目根>/.agentsmd/ast.json --
 - `confirmed` 表示已阅读证据后确认；`inferred`、`unknown` 必须有原因，并在可见文案中写明“推断”或“待核实”。捕获脚本不会替你确认语义。
 - 源码/测试/当前配置优先于 README 和注释；冲突时指出差异。依赖存在不等于已启用，发现测试不等于通过或覆盖全部分支。只记录配置键与必要的非敏感默认值，不输出凭据。
 
-## 4. 编写根文档
+## 5. 编写根文档
 
 根文件保留项目级信息并链接详细说明，避免重复子模块的全部接口：
 
@@ -119,19 +120,28 @@ python3 <skill_dir>/scripts/callgraph.py --ast <项目根>/.agentsmd/ast.json --
 
 统计分别列出资产文件数、各语言索引文件数/符号数、Go 包与其他语言目录分组，另列 production/test/generated。分类互斥，测试中的生成文件归入 test 并保留 generated 标记。不要无依据相加。显式统计标记可包含 `file_count`、`package_count`、`symbol_count`、`by_category`，示例见校验参考；可见表格仍需人工对照。
 
-## 5. 校验与交付
+## 6. 校验与交付
+
+所有目标模块完成阅读与能力说明后，在当前预览地图设置 delivery.mode=complete，并如实填写各模块的完整阅读记录。先用同一预览地图重跑生成器，刷新审阅状态/统计，保留已写正文；再捕获证据和校验：
 
 ```bash
-python3 <skill_dir>/scripts/evidence.py capture --root <项目根> --draft <草稿证据.json>
-python3 <skill_dir>/scripts/verify.py --root <项目根> --require-reviewed
-# 警告也需要判为失败时加 --strict
+python3 <skill_dir>/scripts/draft.py --root <项目根> --map <项目根>/.agentsmd/drafts/modules.draft.json
+python3 <skill_dir>/scripts/evidence.py capture --root <项目根> --map <项目根>/.agentsmd/drafts/modules.draft.json --ledger <项目根>/.agentsmd/drafts/evidence.draft.json
+python3 <skill_dir>/scripts/verify.py --root <项目根> --modules <项目根>/.agentsmd/drafts/modules.draft.json --evidence <项目根>/.agentsmd/drafts/evidence.draft.json --delivery complete
+python3 <skill_dir>/scripts/draft.py --root <项目根> --promote
+python3 <skill_dir>/scripts/verify.py --root <项目根> --delivery complete
+# 警告也需要判为失败时加 --strict；自定义预览目录须替换所有配套路径
 ```
 
-有模块地图时，只检查地图声明的交付文档，避免把仓库中另有用途的指令/模板当作项目导览。无地图时兼容递归检查 `AGENTS*.md`。校验包括引用行范围、链接目标、索引新鲜度、扫描范围、显式统计、模块唯一归属、父子导航、阅读记录、证据区块与源码指纹。`--require-reviewed` 等同于 `--delivery complete`：要求 delivery.mode=complete、边界已核对、完整文件处置、已审阅主要能力清单及四方面证据、真实测试处置。抽样使用 `--delivery sampled` 并显式标注范围，不能因一个入口和一条结论通过就声称完整。旧地图仍可用于草稿检查，但必须补齐这些字段才可完整交付。
+转正默认要求完整阅读、能力清单、正文与已确认的证据在写入前通过检查；失败时继续修正，不改用 sampled 绕过。转正将人工预览正文、最终 modules.json 和 evidence.json 一起写入，重定位链接；原目标有其他编辑时拒绝覆盖。它不提升阅读/测试/结论状态，不刷新源码指纹。只有用户明确要求部分交付时，才在地图记录 delivery.mode=sampled，并在转正及前后校验命令中显式使用 --delivery sampled；未完成模块须可见。
+
+校验未指定 --delivery 时沿用地图的 delivery.mode；地图声明 complete 时，即使省略参数或传入较弱模式也执行完整检查，显式模式与地图不符会报错。转正前对预览及重定位后的文档都执行引用、链接、索引新鲜度和显式统计检查，任何错误均在写入最终目标前拦截。
+
+有模块地图时，只检查地图声明的交付文档，避免把仓库中另有用途的指令/模板当作项目导览。无地图时兼容递归检查 `AGENTS*.md`。校验包括引用行范围、链接目标、索引新鲜度、扫描范围、显式统计、模块唯一归属、父子导航、阅读记录、证据区块与源码指纹。`--require-reviewed` 等同于 `--delivery complete`：要求 delivery.mode=complete、边界已核对、完整文件处置、已审阅主要能力清单及四方面证据、真实测试处置。用户明确要求的抽样交付使用 `--delivery sampled` 并显式标注范围，不能因一个入口和一条结论通过就声称完整。旧地图仍可用于草稿检查，但必须补齐这些字段才可完整交付。
 
 完整交付还会拦截 `agentsmd:placeholder` / `agentsmd:draft-claim` 标记及旧版自动补写提示。阅读后用具体说明替换整个占位区块；有理由的真实待核实事项可以保留，不因出现“待核实”一词就判失败。不要只删除标记或重捕获哈希来消除未完成内容。
 
-完整检查要求根文档有用途、架构与数据流、构建/运行/测试说明，模块文档有职责、功能与流程、依赖协作、测试处置。空标题、纯导航/统计和围栏示例不算正文；不适用时写明具体原因。支持中英文常见标题和嵌套章节，自定义标题在对应正文前用 `<!-- agentsmd:section architecture -->` 等用途标记声明，标记及别名见分析产物参考。此检查只验证必要说明存在，不证明文字与源码语义一致。
+完整检查要求根文档有用途、架构与数据流、构建/运行/测试说明，模块文档有职责、功能与流程、依赖协作、测试处置。空标题、纯导航/统计和代码示例不算正文；有具体说明的表格数据行可作为正文，表头、纯链接、计数和占位行不算说明；不适用时写明具体原因。支持中英文常见标题和嵌套章节，自定义标题在对应正文前用 `<!-- agentsmd:section architecture -->` 等用途标记声明，标记及别名见分析产物参考。此检查只验证必要说明存在，不证明文字与源码语义一致。
 
 校验输出默认按模块和问题类别汇总；`--details` 展开全部诊断，`--json` 输出完整机器可读结果及字段路径。地图、能力和证据字段类型有误会定位到具体字段，不继续按错误结构读写。
 

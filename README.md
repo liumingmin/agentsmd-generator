@@ -73,19 +73,28 @@ python3 /path/to/skill/scripts/modules.py record-review --root /path/to/project 
 python3 /path/to/skill/scripts/teststate.py --root /path/to/project \
   --map /path/to/project/.agentsmd/drafts/modules.draft.json --module storage --cwd . -- python3 -m unittest discover -s tests
 
+# 完成阅读后更新预览地图的范围/能力记录，刷新管理区；不会覆盖已写正文
+python3 /path/to/skill/scripts/draft.py --root /path/to/project \
+  --map /path/to/project/.agentsmd/drafts/modules.draft.json
+
 # 阅读记录和预览正文就绪后，用配套预览地图/ledger 捕获证据
 python3 /path/to/skill/scripts/evidence.py capture --root /path/to/project \
   --map /path/to/project/.agentsmd/drafts/modules.draft.json \
   --ledger /path/to/project/.agentsmd/drafts/evidence.draft.json
 
-# 先用预览地图和证据运行对应交付模式的 verify，再转正到最终文档及正式 map/ledger
+# 默认完整交付：先用预览地图和证据通过 --delivery complete 校验，再转正
+python3 /path/to/skill/scripts/verify.py --root /path/to/project \
+  --modules /path/to/project/.agentsmd/drafts/modules.draft.json \
+  --evidence /path/to/project/.agentsmd/drafts/evidence.draft.json --delivery complete
 python3 /path/to/skill/scripts/draft.py --root /path/to/project --promote
 
 # 交付检查：包括阅读记录、测试处置与已确认的行为证据
 python3 /path/to/skill/scripts/verify.py --root /path/to/project --require-reviewed
 ```
 
-模块、证据、扫描配置、状态和统计格式见 [`references/analysis-artifacts.md`](references/analysis-artifacts.md)，写作粒度见 [`references/module-doc-template.md`](references/module-doc-template.md)。`--require-reviewed` 适合完整交付；分批审阅时使用 `--delivery sampled` 并在文档中明确抽样范围。完整交付要求所有文件有阅读/排除处置，且主要能力的输入、成功、失败与配置方面有匹配结论或不适用理由；旧地图需要补齐字段。`--strict` 让警告也视为失败。完整交付会拦截生成占位章节和草稿标记；有理由的实际未知事项仍可单独记录。阅读哈希过期需要先复核代码，再 record-review，不能通过重跑 capture 自动刷新。
+模块、证据、扫描配置、状态和统计格式见 [`references/analysis-artifacts.md`](references/analysis-artifacts.md)，写作粒度见 [`references/module-doc-template.md`](references/module-doc-template.md)。`--promote` 默认执行完整交付检查；未读完模块或证据未确认时拒绝转正。分批阅读需持续到全部目标模块完成，不能自行降级为抽样交付；仅当用户明确要求部分交付时，地图设置 `delivery.mode=sampled`，转正及前后校验显式使用 `--delivery sampled` 并在文档中明确范围。完整交付要求所有文件有阅读/排除处置，且主要能力的输入、成功、失败与配置方面有匹配结论或不适用理由；旧地图需要补齐字段。`--strict` 让警告也视为失败。完整交付会拦截生成占位章节和草稿标记；有理由的实际未知事项仍可单独记录。阅读哈希过期需要先复核代码，再 record-review，不能通过重跑 capture 自动刷新。
+
+校验未指定交付模式时沿用地图声明，complete 不会退回草稿检查；显式模式与地图不一致会报错。转正前对预览和重定位后的正文执行同一套链接、行号、新鲜度与统计检查，错误会在写入最终文件前拦截。选择预览地图时，未指定的 ledger 默认取自该预览会话，适用于生成、证据捕获、verify 与转正。
 
 校验默认按模块和类别聚合，`--details` 展开全部诊断，`--json` 输出完整结果与精确字段位置；字段结构有误时停止处理，不输出异常堆栈。
 
